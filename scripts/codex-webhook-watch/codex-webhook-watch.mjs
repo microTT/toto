@@ -14,6 +14,7 @@ Options:
   --at-mobiles <list>   Comma-separated mobile numbers for DingTalk @.
   --at-user-ids <list>  Comma-separated DingTalk user IDs for @.
   --at-all              Mention everyone in DingTalk.
+  --approval-wait <ms>  Wait before flagging a pending manual approval. Default: 2500.
   --interval <ms>       Poll interval in milliseconds. Default: 1500.
   --replay              Read existing session content from the beginning.
   --dry-run             Print events instead of POSTing them.
@@ -30,6 +31,7 @@ function parseArgs(argv) {
     atMobiles: splitList(process.env.CODEX_DINGTALK_AT_MOBILES || ""),
     atUserIds: splitList(process.env.CODEX_DINGTALK_AT_USER_IDS || ""),
     atAll: process.env.CODEX_DINGTALK_AT_ALL === "true",
+    approvalWaitMs: 2500,
     intervalMs: 1500,
     replay: false,
     dryRun: false,
@@ -65,6 +67,10 @@ function parseArgs(argv) {
     }
     if (arg === "--at-all") {
       options.atAll = true;
+      continue;
+    }
+    if (arg === "--approval-wait") {
+      options.approvalWaitMs = Number(argv[++i] || options.approvalWaitMs);
       continue;
     }
     if (arg === "--interval") {
@@ -167,24 +173,141 @@ function buildTaskCompleteEvent(record, state, filePath) {
   };
 }
 
-function buildApprovalEvent(record, state, filePath) {
+function extractApprovedPrefixRules(record) {
+  if (record?.type !== "response_item" || record.payload?.type !== "message" || record.payload?.role !== "developer") {
+    return null;
+  }
+
+  const content = Array.isArray(record.payload.content) ? record.payload.content : [];
+  const collected = [];
+
+  for (const item of content) {
+    if (item?.type !== "input_text" || typeof item.text !== "string") {
+      continue;
+    }
+
+    const match = item.text.match(
+      /The following prefix rules have already been approved:\s*([\s\S]*?)(?:\n\s*The writable roots are|\n<\/permissions instructions>)/,
+    );
+    if (!match) {
+      continue;
+    }
+
+    const lines = match[1].split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("- [")) {
+        continue;
+      }
+      const arrayStart = trimmed.indexOf("[");
+      const jsonText = trimmed.slice(arrayStart);
+      const parsed = safeJsonParse(jsonText);
+      if (Array.isArray(parsed) && parsed.every(part => typeof part === "string")) {
+        collected.push(parsed);
+      }
+    }
+  }
+
+  return collected.length > 0 ? collected : null;
+}
+
+function arrayStartsWith(source, prefix) {
+  if (!Array.isArray(source) || !Array.isArray(prefix) || prefix.length > source.length) {
+    return false;
+  }
+
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (source[i] !== prefix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isAlreadyApproved(prefixRule, command, approvedPrefixRules) {
+  if (!Array.isArray(approvedPrefixRules) || approvedPrefixRules.length === 0) {
+    return false;
+  }
+
+  for (const approved of approvedPrefixRules) {
+    if (arrayStartsWith(prefixRule, approved)) {
+      return true;
+    }
+    const approvedText = approved.join(" ");
+    if (approvedText && typeof command === "string" && command.startsWith(approvedText)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function rememberApprovalCall(record, state, filePath) {
   const args = safeJsonParse(record.payload.arguments);
   if (!args || args.sandbox_permissions !== "require_escalated") {
     return null;
   }
 
-  return {
-    event: "approval_needed",
+  state.pendingApprovals.set(record.payload.call_id, {
+    call_id: record.payload.call_id,
     timestamp: record.timestamp,
-    session_id: state.sessionId,
+    createdAtMs: Date.parse(record.timestamp),
     turn_id: state.currentTurnId || null,
     tool_name: record.payload.name,
     command: args.cmd || null,
-    workdir: args.workdir || null,
+    workdir: args.workdir || state.currentCwd || null,
     justification: args.justification || null,
     prefix_rule: Array.isArray(args.prefix_rule) ? args.prefix_rule : null,
+    alreadyApproved: isAlreadyApproved(
+      Array.isArray(args.prefix_rule) ? args.prefix_rule : [],
+      args.cmd || "",
+      state.approvedPrefixRules,
+    ),
+    guardianSeen: false,
+    notified: false,
     file: filePath,
+  });
+  return null;
+}
+
+function buildApprovalEvent(pending, state) {
+  return {
+    event: "approval_needed",
+    timestamp: pending.timestamp,
+    session_id: state.sessionId,
+    turn_id: pending.turn_id || state.currentTurnId || null,
+    call_id: pending.call_id,
+    tool_name: pending.tool_name,
+    command: pending.command || null,
+    workdir: pending.workdir || null,
+    justification: pending.justification,
+    prefix_rule: pending.prefix_rule,
+    file: pending.file,
   };
+}
+
+function cleanupApprovalState(record, state) {
+  if (record?.type === "response_item" && record.payload?.type === "function_call_output") {
+    state.pendingApprovals.delete(record.payload.call_id);
+    return;
+  }
+
+  if (record?.type === "event_msg" && record.payload?.type === "exec_command_end") {
+    state.pendingApprovals.delete(record.payload.call_id);
+    return;
+  }
+
+  if (record?.type === "event_msg" && record.payload?.type === "guardian_assessment") {
+    const pending = state.pendingApprovals.get(record.payload.id);
+    if (pending) {
+      pending.guardianSeen = true;
+      pending.turn_id = record.payload.turn_id || pending.turn_id;
+      pending.workdir = pending.workdir || record.payload.action?.cwd || null;
+    }
+    if (record.payload?.status && record.payload.status !== "in_progress") {
+      state.pendingApprovals.delete(record.payload.id);
+    }
+  }
 }
 
 async function postWebhook(url, payload) {
@@ -292,31 +415,7 @@ function buildDingTalkBody(payload, options) {
   };
 }
 
-async function handleRecord(record, state, options, filePath) {
-  if (record?.type === "session_meta" && record.payload?.id) {
-    state.sessionId = record.payload.id;
-  }
-
-  if (record?.type === "event_msg" && record.payload?.type === "task_started") {
-    state.currentTurnId = record.payload.turn_id || state.currentTurnId;
-  }
-
-  if (record?.type === "turn_context" && record.payload?.turn_id) {
-    state.currentTurnId = record.payload.turn_id;
-  }
-
-  let payload = null;
-
-  if (record?.type === "event_msg" && record.payload?.type === "task_complete") {
-    if (options.events.has("task_complete")) {
-      payload = buildTaskCompleteEvent(record, state, filePath);
-    }
-  } else if (record?.type === "response_item" && record.payload?.type === "function_call") {
-    if (options.events.has("approval_needed")) {
-      payload = buildApprovalEvent(record, state, filePath);
-    }
-  }
-
+async function emitPayload(payload, state, options) {
   if (!payload) {
     return;
   }
@@ -326,6 +425,7 @@ async function handleRecord(record, state, options, filePath) {
     payload.session_id || "unknown",
     payload.turn_id || "unknown",
     payload.timestamp || "unknown",
+    payload.call_id || "",
     payload.command || "",
   ].join("|");
 
@@ -343,6 +443,64 @@ async function handleRecord(record, state, options, filePath) {
   }
 
   await postWebhook(options.url, dingTalkBody);
+}
+
+async function maybeEmitPendingApprovals(state, options) {
+  if (!options.events.has("approval_needed")) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  for (const pending of state.pendingApprovals.values()) {
+    if (pending.notified || pending.guardianSeen || pending.alreadyApproved) {
+      continue;
+    }
+    if (!Number.isFinite(pending.createdAtMs)) {
+      continue;
+    }
+    if (nowMs - pending.createdAtMs < options.approvalWaitMs) {
+      continue;
+    }
+
+    pending.notified = true;
+    await emitPayload(buildApprovalEvent(pending, state), state, options);
+  }
+}
+
+async function handleRecord(record, state, options, filePath) {
+  const approvedPrefixRules = extractApprovedPrefixRules(record);
+  if (approvedPrefixRules) {
+    state.approvedPrefixRules = approvedPrefixRules;
+  }
+
+  cleanupApprovalState(record, state);
+
+  if (record?.type === "session_meta" && record.payload?.id) {
+    state.sessionId = record.payload.id;
+  }
+
+  if (record?.type === "event_msg" && record.payload?.type === "task_started") {
+    state.currentTurnId = record.payload.turn_id || state.currentTurnId;
+  }
+
+  if (record?.type === "turn_context" && record.payload?.turn_id) {
+    state.currentTurnId = record.payload.turn_id;
+    state.currentCwd = record.payload.cwd || state.currentCwd || null;
+  }
+
+  let payload = null;
+
+  if (record?.type === "event_msg" && record.payload?.type === "task_complete") {
+    if (options.events.has("task_complete")) {
+      payload = buildTaskCompleteEvent(record, state, filePath);
+    }
+  } else if (record?.type === "response_item" && record.payload?.type === "function_call") {
+    if (options.events.has("approval_needed")) {
+      payload = rememberApprovalCall(record, state, filePath);
+    }
+  }
+
+  await emitPayload(payload, state, options);
 }
 
 async function readDelta(filePath, start, end) {
@@ -379,6 +537,7 @@ async function processFile(filePath, state, options) {
   }
 
   if (stats.size === state.offset) {
+    await maybeEmitPendingApprovals(state, options);
     return;
   }
 
@@ -399,6 +558,8 @@ async function processFile(filePath, state, options) {
     }
     await handleRecord(record, state, options, filePath);
   }
+
+  await maybeEmitPendingApprovals(state, options);
 }
 
 async function main() {
@@ -418,6 +579,9 @@ async function main() {
         states.set(filePath, {
           sessionId: parseSessionIdFromPath(filePath),
           currentTurnId: null,
+          currentCwd: null,
+          approvedPrefixRules: [],
+          pendingApprovals: new Map(),
           offset: 0,
           remainder: "",
           initialized: false,

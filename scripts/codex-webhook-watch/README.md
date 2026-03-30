@@ -19,7 +19,11 @@
 - `task_complete`
   - Codex 一个 turn 完成时发送通知
 - `approval_needed`
-  - 检测到 `require_escalated` 的命令调用时发送通知
+  - 只对“看起来真的在等人审批”的提权请求发送通知
+  - 具体规则是：
+    - 已在 approved prefix rules 里的命令不通知
+    - 已进入 `guardian_assessment` 路径的自动审批不通知
+    - 没有进入 `guardian_assessment`、并且短时间内仍未执行完成的 `require_escalated` 请求会通知
 
 ## 钉钉消息格式
 
@@ -70,6 +74,8 @@ node /Users/microTT/toto/scripts/codex-webhook-watch/codex-webhook-watch.mjs \
   - 逗号分隔，默认 `task_complete,approval_needed`
 - `--interval`
   - 轮询间隔，默认 `1500`
+- `--approval-wait`
+  - 判定为“人工审批等待中”前的等待时间，默认 `2500`
 - `--replay`
   - 从现有 session 文件头开始扫描
 - `--dry-run`

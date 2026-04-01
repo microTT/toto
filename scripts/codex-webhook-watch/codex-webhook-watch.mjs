@@ -14,6 +14,10 @@ Options:
   --at-mobiles <list>   Comma-separated mobile numbers for DingTalk @.
   --at-user-ids <list>  Comma-separated DingTalk user IDs for @.
   --at-all              Mention everyone in DingTalk.
+  --approval-mcp-servers <list>
+                        Comma-separated MCP server names whose pending tool calls
+                        should be treated as approval waits. Default:
+                        chrome-devtools,chrome_devtools.
   --approval-wait <ms>  Wait before flagging a pending manual approval. Default: 2500.
   --interval <ms>       Poll interval in milliseconds. Default: 1500.
   --replay              Read existing session content from the beginning.
@@ -31,6 +35,12 @@ function parseArgs(argv) {
     atMobiles: splitList(process.env.CODEX_DINGTALK_AT_MOBILES || ""),
     atUserIds: splitList(process.env.CODEX_DINGTALK_AT_USER_IDS || ""),
     atAll: process.env.CODEX_DINGTALK_AT_ALL === "true",
+    approvalMcpServers: new Set(
+      splitList(
+        process.env.CODEX_APPROVAL_MCP_SERVERS ||
+          "chrome-devtools,chrome_devtools",
+      ),
+    ),
     approvalWaitMs: 2500,
     intervalMs: 1500,
     replay: false,
@@ -67,6 +77,10 @@ function parseArgs(argv) {
     }
     if (arg === "--at-all") {
       options.atAll = true;
+      continue;
+    }
+    if (arg === "--approval-mcp-servers") {
+      options.approvalMcpServers = new Set(splitList(argv[++i] || ""));
       continue;
     }
     if (arg === "--approval-wait") {
@@ -242,30 +256,98 @@ function isAlreadyApproved(prefixRule, command, approvedPrefixRules) {
   return false;
 }
 
-function rememberApprovalCall(record, state, filePath) {
+function parseMcpToolName(toolName) {
+  if (typeof toolName !== "string" || !toolName.startsWith("mcp__")) {
+    return null;
+  }
+
+  const parts = toolName.split("__");
+  if (parts.length < 3 || parts[0] !== "mcp") {
+    return null;
+  }
+
+  const [, server, ...toolParts] = parts;
+  if (!server || toolParts.length === 0) {
+    return null;
+  }
+
+  return {
+    server,
+    tool: toolParts.join("__"),
+  };
+}
+
+function stringifyMcpArgumentsPreview(rawArguments) {
+  const parsed = safeJsonParse(rawArguments);
+  const value = parsed ?? rawArguments;
+
+  try {
+    return truncateText(JSON.stringify(value), 1200);
+  } catch {
+    return truncateText(String(value ?? ""), 1200);
+  }
+}
+
+function rememberApprovalCall(record, state, filePath, options) {
+  const toolName = record?.payload?.name;
+  if (typeof toolName !== "string") {
+    return null;
+  }
+
   const args = safeJsonParse(record.payload.arguments);
-  if (!args || args.sandbox_permissions !== "require_escalated") {
+  if (args && args.sandbox_permissions === "require_escalated") {
+    state.pendingApprovals.set(record.payload.call_id, {
+      approval_kind: "sandbox_command",
+      call_id: record.payload.call_id,
+      timestamp: record.timestamp,
+      createdAtMs: Date.parse(record.timestamp),
+      turn_id: state.currentTurnId || null,
+      tool_name: toolName,
+      command: args.cmd || null,
+      workdir: args.workdir || state.currentCwd || null,
+      justification: args.justification || null,
+      prefix_rule: Array.isArray(args.prefix_rule) ? args.prefix_rule : null,
+      alreadyApproved: isAlreadyApproved(
+        Array.isArray(args.prefix_rule) ? args.prefix_rule : [],
+        args.cmd || "",
+        state.approvedPrefixRules,
+      ),
+      guardianSeen: false,
+      notified: false,
+      file: filePath,
+      mcp_server: null,
+      mcp_tool: null,
+      mcp_arguments_preview: null,
+    });
+    return null;
+  }
+
+  const mcpTool = parseMcpToolName(toolName);
+  if (
+    !mcpTool ||
+    !options.approvalMcpServers.has(mcpTool.server)
+  ) {
     return null;
   }
 
   state.pendingApprovals.set(record.payload.call_id, {
+    approval_kind: "mcp_tool",
     call_id: record.payload.call_id,
     timestamp: record.timestamp,
     createdAtMs: Date.parse(record.timestamp),
     turn_id: state.currentTurnId || null,
-    tool_name: record.payload.name,
-    command: args.cmd || null,
-    workdir: args.workdir || state.currentCwd || null,
-    justification: args.justification || null,
-    prefix_rule: Array.isArray(args.prefix_rule) ? args.prefix_rule : null,
-    alreadyApproved: isAlreadyApproved(
-      Array.isArray(args.prefix_rule) ? args.prefix_rule : [],
-      args.cmd || "",
-      state.approvedPrefixRules,
-    ),
+    tool_name: toolName,
+    command: null,
+    workdir: state.currentCwd || null,
+    justification: null,
+    prefix_rule: null,
+    alreadyApproved: false,
     guardianSeen: false,
     notified: false,
     file: filePath,
+    mcp_server: mcpTool.server,
+    mcp_tool: mcpTool.tool,
+    mcp_arguments_preview: stringifyMcpArgumentsPreview(record.payload.arguments),
   });
   return null;
 }
@@ -283,6 +365,10 @@ function buildApprovalEvent(pending, state) {
     justification: pending.justification,
     prefix_rule: pending.prefix_rule,
     file: pending.file,
+    approval_kind: pending.approval_kind || "sandbox_command",
+    mcp_server: pending.mcp_server || null,
+    mcp_tool: pending.mcp_tool || null,
+    mcp_arguments_preview: pending.mcp_arguments_preview || null,
   };
 }
 
@@ -383,12 +469,22 @@ function buildDingTalkBody(payload, options) {
     ];
   } else if (payload.event === "approval_needed") {
     title = "Codex 需要审批";
-    detailLines = [
-      `- 工具: \`${payload.tool_name || "unknown"}\``,
-      `- 工作目录: \`${payload.workdir || "unknown"}\``,
-      `- 审批原因: ${payload.justification || "unknown"}`,
-      `- 命令: \`${truncateText(payload.command || "unknown", 1200)}\``,
-    ];
+    if (payload.approval_kind === "mcp_tool") {
+      detailLines = [
+        `- 工具: \`${payload.tool_name || "unknown"}\``,
+        `- MCP Server: \`${payload.mcp_server || "unknown"}\``,
+        `- MCP Tool: \`${payload.mcp_tool || "unknown"}\``,
+        `- 工作目录: \`${payload.workdir || "unknown"}\``,
+        `- 参数: \`${payload.mcp_arguments_preview || "unknown"}\``,
+      ];
+    } else {
+      detailLines = [
+        `- 工具: \`${payload.tool_name || "unknown"}\``,
+        `- 工作目录: \`${payload.workdir || "unknown"}\``,
+        `- 审批原因: ${payload.justification || "unknown"}`,
+        `- 命令: \`${truncateText(payload.command || "unknown", 1200)}\``,
+      ];
+    }
 
     if (Array.isArray(payload.prefix_rule) && payload.prefix_rule.length > 0) {
       detailLines.push(`- Prefix Rule: \`${payload.prefix_rule.join(" ")}\``);
@@ -496,7 +592,7 @@ async function handleRecord(record, state, options, filePath) {
     }
   } else if (record?.type === "response_item" && record.payload?.type === "function_call") {
     if (options.events.has("approval_needed")) {
-      payload = rememberApprovalCall(record, state, filePath);
+      payload = rememberApprovalCall(record, state, filePath, options);
     }
   }
 

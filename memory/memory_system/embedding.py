@@ -16,8 +16,14 @@ DEFAULT_DIMENSIONS = 128
 DEFAULT_REMOTE_DIMENSIONS = 1024
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-Embedding-4B"
 DEFAULT_QWEN_MAX_LENGTH = 8192
-DOCUMENT_INSTRUCTION = "Represent this developer-workspace memory record for future retrieval."
-QUERY_INSTRUCTION = "Represent this query for retrieving archived developer-workspace memory."
+DOCUMENT_INSTRUCTION = (
+    "为后续检索表示这条开发工作区记忆记录。"
+    " Represent this developer-workspace memory record for future retrieval."
+)
+QUERY_INSTRUCTION = (
+    "为检索开发工作区归档记忆表示这个查询。"
+    " Represent this query for retrieving archived developer-workspace memory."
+)
 DEFAULT_ENV_FILE_NAME = ".env"
 
 

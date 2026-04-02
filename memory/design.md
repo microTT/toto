@@ -418,18 +418,19 @@ codex features enable codex_hooks
 
 ```text
 [MEMORY LOADED]
+记忆已加载。
 
-Global long-term memory:
-- ...
-- ...
-
-Workspace recent memory:
+全局长期记忆：
 - ...
 - ...
 
-Older workspace memory is NOT auto-loaded.
-If the user refers to earlier attempts, previous bugs, past decisions, or “what we did before”,
-use MCP tool: memory.search_old
+工作区近期记忆：
+- ...
+- ...
+
+历史工作区记忆不会自动加载。
+如果用户提到更早的尝试、历史 bug、过去决策，或“之前我们做过什么”，
+请使用 MCP 工具：memory.search_old
 ```
 
 ### 加载内容范围
@@ -961,13 +962,13 @@ Qwen3 Embedding 系列当前公开信息显示：它有 0.6B / 4B / 8B 三个 em
 ### 文档 embedding
 
 ```text
-Represent this developer-workspace memory record for future retrieval.
+为后续检索表示这条开发工作区记忆记录。 Represent this developer-workspace memory record for future retrieval.
 ```
 
 ### 查询 embedding
 
 ```text
-Represent this query for retrieving archived developer-workspace memory.
+为检索开发工作区归档记忆表示这个查询。 Represent this query for retrieving archived developer-workspace memory.
 ```
 
 ## 12.3 配置方式

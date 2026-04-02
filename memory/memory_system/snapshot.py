@@ -71,24 +71,24 @@ def compute_source_fingerprint(config: MemoryConfig, recent_files: list[Path] | 
 
 
 def render_snapshot_block(global_records: list[MemoryRecord], local_records: list[MemoryRecord]) -> str:
-    lines = ["[MEMORY LOADED]", "", "Global long-term memory:"]
+    lines = ["[MEMORY LOADED]", "记忆已加载。", "", "全局长期记忆："]
     if global_records:
         for record in global_records:
             lines.append(f"- {_render_record_line(record)}")
     else:
-        lines.append("- None.")
-    lines.extend(["", "Workspace recent memory:"])
+        lines.append("- 无。")
+    lines.extend(["", "工作区近期记忆："])
     if local_records:
         for record in local_records:
             lines.append(f"- {_render_record_line(record)}")
     else:
-        lines.append("- None.")
+        lines.append("- 无。")
     lines.extend(
         [
             "",
-            "Older workspace memory is NOT auto-loaded.",
-            "If the user refers to earlier attempts, previous bugs, past decisions, or what we did before,",
-            "use MCP tool: memory.search_old",
+            "历史工作区记忆不会自动加载。",
+            "如果用户提到更早的尝试、历史 bug、过去决策，或“之前我们做过什么”，",
+            "请使用 MCP 工具：memory.search_old",
         ]
     )
     return "\n".join(lines)

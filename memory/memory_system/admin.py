@@ -10,6 +10,7 @@ from .archive import archive_stale_recent_documents
 from .bootstrap import ensure_layout
 from .config import resolve_config
 from .constants import GLOBAL_SCOPE, LOCAL_RECENT_SCOPE
+from .migration import migrate_records_to_zh
 from .markdown_store import get_record, load_document
 from .patch_applier import apply_patch_plan, current_base_revisions
 from .record_store import find_record
@@ -27,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("bootstrap")
     subparsers.add_parser("context")
     subparsers.add_parser("archive")
+    subparsers.add_parser("migrate-zh")
     subparsers.add_parser("print-hooks-config")
     rebuild_parser = subparsers.add_parser("rebuild-index")
     rebuild_parser.add_argument("--json", action="store_true")
@@ -85,6 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         archived = archive_stale_recent_documents(config)
         _refresh_index(config)
         print(json.dumps({"archived": [str(path) for path in archived]}, indent=2))
+        return 0
+    if args.command == "migrate-zh":
+        payload = migrate_records_to_zh(config)
+        _refresh_index(config)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     if args.command == "print-hooks-config":
         print(json.dumps(_hooks_config(config), indent=2))

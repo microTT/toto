@@ -40,31 +40,31 @@ def build_patch_prompt(
             delta_lines.append(f"USER: {user_message}")
         if assistant_message:
             delta_lines.append(f"ASSISTANT: {assistant_message}")
-    transcript_delta = "\n".join(delta_lines) or "(no transcript delta available)"
+    transcript_delta = "\n".join(delta_lines) or "（无可用的对话增量）"
     base_revisions = {
         "global_revision": global_document.revision,
         "local_recent_revision": sum(document.revision for document in recent_documents),
     }
     return (
-        "Task brief:\n"
-        "You are a memory summarizer. Output JSON only. Do not modify files directly.\n\n"
-        "Transcript delta:\n"
+        "任务说明：\n"
+        "你是记忆总结器。仅输出 JSON，不要直接修改文件。\n\n"
+        "对话增量：\n"
         f"{transcript_delta}\n\n"
-        "Current active global memory:\n"
+        "当前激活的全局记忆：\n"
         f"{json.dumps(active_global, indent=2, ensure_ascii=True)}\n\n"
-        "Current active local recent memory:\n"
+        "当前激活的本地近期记忆：\n"
         f"{json.dumps(active_local, indent=2, ensure_ascii=True)}\n\n"
-        "Policy:\n"
-        "- Keep only durable preferences/constraints in global memory.\n"
-        "- Keep repo-specific blockers, TODOs, failed attempts, and near-term facts in local recent memory.\n"
-        "- Use promote when a local record should become global; use demote when a global record is actually repo-specific.\n"
-        "- Never store secrets, raw tool logs, or unsupported speculation.\n"
-        "- Respect the base_revisions exactly.\n\n"
-        "Base revisions:\n"
+        "策略：\n"
+        "- 全局记忆仅保留可跨仓库复用的长期偏好与稳定约束。\n"
+        "- 本地近期记忆保留仓库相关的阻塞项、TODO、失败结论和近期事实。\n"
+        "- local 记录应上升为全局时用 promote；全局记录实际是仓库私有时用 demote。\n"
+        "- 不要写入密钥、原始工具日志或无依据推测。\n"
+        "- 必须严格遵守 base_revisions。\n\n"
+        "基础版本：\n"
         f"{json.dumps(base_revisions, indent=2, ensure_ascii=True)}\n\n"
-        "Output schema:\n"
-        "Return a patch plan with decision, reason, base_revisions, global_ops, local_ops, and needs_manual_review.\n"
-        "Allowed actions: create, update, supersede, delete, pin, promote, demote.\n"
+        "输出要求：\n"
+        "返回 patch plan，包含 decision、reason、base_revisions、global_ops、local_ops、needs_manual_review。\n"
+        "允许动作：create、update、supersede、delete、pin、promote、demote。\n"
     )
 
 
@@ -97,25 +97,25 @@ def heuristic_patch_plan(*, config: MemoryConfig, events: list[dict[str, Any]]) 
     )
     decision = "noop"
     local_ops: list[dict[str, Any]] = []
-    reason = "no durable memory candidate"
+    reason = "没有可写入的记忆候选"
     lowered = combined.lower()
-    if "remember next step:" in lowered:
+    next_step = _extract_next_step(combined, lowered=lowered)
+    if next_step:
         decision = "write"
-        reason = "explicit remember next step"
-        next_step = combined.split(":", 1)[1].strip()
+        reason = "检测到显式的下一步记忆请求"
         local_ops.append(
             {
                 "action": "create",
                 "record": {
                     "type": "task_context",
                     "status": "open",
-                    "subject": "next step",
+                    "subject": "下一步",
                     "summary": next_step,
                     "confidence": "high",
-                    "tags": ["todo"],
+                    "tags": ["todo", "next-step"],
                     "source_refs": [],
-                    "scope_reason": "repo-specific and near-term",
-                    "next_use": next_step,
+                    "scope_reason": "仓库内近期待办",
+                    "next_use": f"恢复当前仓库工作时优先执行：{next_step}",
                 },
             }
         )
@@ -195,3 +195,25 @@ def _normalize_model_op(op: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, dict):
             cleaned[field] = {nested_key: nested_value for nested_key, nested_value in value.items() if nested_value is not None}
     return cleaned
+
+
+def _extract_next_step(combined: str, *, lowered: str | None = None) -> str | None:
+    lowered_text = lowered or combined.lower()
+    english_markers = ("remember next step:", "remember next step：")
+    chinese_markers = (
+        "记住下一步:",
+        "记住下一步：",
+        "下一步:",
+        "下一步：",
+        "下次继续:",
+        "下次继续：",
+    )
+    for marker in english_markers:
+        start = lowered_text.find(marker)
+        if start >= 0:
+            return combined[start + len(marker) :].strip() or None
+    for marker in chinese_markers:
+        start = combined.find(marker)
+        if start >= 0:
+            return combined[start + len(marker) :].strip() or None
+    return None

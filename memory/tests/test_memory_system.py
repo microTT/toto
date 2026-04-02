@@ -307,6 +307,76 @@ class MemorySystemTest(unittest.TestCase):
         snapshot = build_snapshot(self.config)
         self.assertIn("revisit the failing auth snapshot", snapshot.rendered_text)
 
+    def test_migrate_zh_translates_existing_memory_records(self) -> None:
+        self._run_admin(
+            [
+                "--cwd",
+                str(self.workspace),
+                "upsert",
+                "--scope",
+                "global",
+                "--id",
+                "g_name_pref",
+                "--type",
+                "preference",
+                "--subject",
+                "Assistant name preference",
+                "--summary",
+                "User wants the assistant to be called 思绎 in future conversations.",
+                "--rationale",
+                "The user explicitly said: 记住,你以后叫 思绎.",
+                "--next-use",
+                "Refer to the assistant as 思绎 in future conversations.",
+                "--tags",
+                "global,preference,naming",
+                "--scope-reason",
+                "This is a durable user preference that applies across repositories and future sessions, so it belongs in global memory.",
+            ]
+        )
+        self._run_admin(
+            [
+                "--cwd",
+                str(self.workspace),
+                "upsert",
+                "--scope",
+                "local",
+                "--id",
+                "l_launchd_todo",
+                "--type",
+                "todo",
+                "--subject",
+                "Launchd daemon smoke test",
+                "--summary",
+                "Near-term repo-specific next step: run a launchd daemon smoke test.",
+                "--next-use",
+                "Surface when resuming work in this repository as an immediate follow-up task.",
+                "--tags",
+                "repo-specific,near-term,todo,launchd",
+                "--scope-reason",
+                "repo-specific and near-term",
+            ]
+        )
+
+        payload = json.loads(
+            self._run_admin(["--cwd", str(self.workspace), "migrate-zh"])
+        )
+        self.assertEqual(payload["changed_records"], 2)
+
+        global_match = find_record(self.config, "g_name_pref")
+        self.assertIsNotNone(global_match)
+        global_record = global_match[3]
+        self.assertEqual(global_record.subject, "助手名称偏好")
+        self.assertEqual(global_record.summary, "用户希望在后续对话中把助手称为 思绎。")
+        self.assertEqual(global_record.next_use, "后续对话中将助手称为 思绎。")
+        self.assertIn("用户明确说过", global_record.rationale)
+
+        local_match = find_record(self.config, "l_launchd_todo")
+        self.assertIsNotNone(local_match)
+        local_record = local_match[3]
+        self.assertEqual(local_record.subject, "Launchd 常驻进程冒烟测试")
+        self.assertEqual(local_record.summary, "当前仓库近期下一步：执行一次 Launchd 常驻进程冒烟测试。")
+        self.assertEqual(local_record.next_use, "恢复该仓库工作时，优先展示并继续这项任务。")
+
     def test_patch_rejects_stale_revision(self) -> None:
         self._run_admin(
             [
@@ -628,8 +698,10 @@ class MemorySystemTest(unittest.TestCase):
         self.assertEqual(captured_requests[0][0], "http://localhost:8080/embed")
         self.assertEqual(captured_requests[0][1]["inputs"], ["alpha document"])
         self.assertEqual(captured_requests[0][2]["Authorization"], "Bearer test-token")
-        self.assertTrue(captured_requests[1][1]["inputs"][0].startswith("Instruct: Represent this query for retrieving archived developer-workspace memory."))
-        self.assertIn("Query:auth snapshot", captured_requests[1][1]["inputs"][0])
+        query_instruction = captured_requests[1][1]["inputs"][0]
+        self.assertTrue(query_instruction.startswith("Instruct: 为检索开发工作区归档记忆表示这个查询。"))
+        self.assertIn("Represent this query for retrieving archived developer-workspace memory.", query_instruction)
+        self.assertIn("Query:auth snapshot", query_instruction)
 
     def test_embedding_settings_load_from_dotenv_file(self) -> None:
         env_file = self.memory_home / ".env"

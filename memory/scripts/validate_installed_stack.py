@@ -13,7 +13,7 @@ def run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="validate_installed_stack")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--memory-home", required=True)
-    parser.add_argument("--expected-task", default="Revisit the failing auth snapshot")
+    parser.add_argument("--expected-task", default="重新检查失败的 auth 快照")
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace).resolve()
@@ -143,9 +143,13 @@ def _run_codex_exec(
         if hook_marker not in output:
             raise AssertionError(f"missing hook marker {hook_marker!r} in codex output")
     last_message = last_message_path.read_text(encoding="utf-8").strip()
-    if last_message.casefold() != expected_last_message.casefold():
+    if _normalize_last_message(last_message) != _normalize_last_message(expected_last_message):
         raise AssertionError(f"unexpected last message: {last_message!r} != {expected_last_message!r}")
     return {"name": f"codex_exec:{expected_last_message}", "ok": True}
+
+
+def _normalize_last_message(value: str) -> str:
+    return value.strip().rstrip(".。!！").casefold()
 
 
 def _run_worker(memoryd_path: Path, workspace: Path, memory_home: Path) -> dict[str, object]:

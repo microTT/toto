@@ -19,7 +19,7 @@ Within `memory_home`, the layout is:
 - `memory/bin/memory-admin`
   Manual operations for bootstrap, context, upsert, delete, pin, archive, search, and index rebuild.
 - `memory/bin/memory-mcp`
-  Minimal stdio MCP server exposing memory read tools, with optional write tools behind `--allow-writes`.
+  Minimal stdio MCP server. Installed usage should enable `--allow-writes` so `memory.upsert`, `memory.delete`, and `memory.rebuild_index` are exposed alongside read tools.
 - `memory/memory_system/`
   Python implementation.
 - `memory/schemas/memory_patch.schema.json`

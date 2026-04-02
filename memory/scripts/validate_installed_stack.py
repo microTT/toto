@@ -61,6 +61,8 @@ def _check_installed_config(hook_path: Path, mcp_path: Path, memory_home: Path) 
         raise AssertionError(f"{config_path} does not reference {mcp_path}")
     if str(memory_home) not in config_text:
         raise AssertionError(f"{config_path} does not pass --memory-home {memory_home}")
+    if '"--allow-writes"' not in config_text:
+        raise AssertionError(f"{config_path} does not enable --allow-writes for memory-local MCP")
     return {"name": "installed_config", "ok": True}
 
 
@@ -92,7 +94,7 @@ def _check_mcp_stdio(mcp_path: Path, workspace: Path, memory_home: Path) -> dict
         ]
     )
     completed = subprocess.run(
-        [str(mcp_path), "--cwd", str(workspace), "--memory-home", str(memory_home)],
+        [str(mcp_path), "--cwd", str(workspace), "--memory-home", str(memory_home), "--allow-writes"],
         input=request_stream,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -105,6 +107,8 @@ def _check_mcp_stdio(mcp_path: Path, workspace: Path, memory_home: Path) -> dict
     tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
     if "memory.get_context" not in tool_names:
         raise AssertionError("memory.get_context missing from tools/list")
+    if "memory.delete" not in tool_names:
+        raise AssertionError("memory.delete missing from tools/list")
     context_text = responses[2]["result"]["content"][0]["text"]
     if "rendered_text" not in context_text:
         raise AssertionError("memory.get_context did not return snapshot payload")

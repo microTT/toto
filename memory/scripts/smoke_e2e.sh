@@ -85,19 +85,8 @@ python3 -m compileall "${MEMORY_DIR}/memory_system" "${MEMORY_DIR}/tests"
 log_step "unittest"
 python3 -m unittest discover -s "${MEMORY_DIR}/tests" -t "${REPO_ROOT}"
 
-log_step "codex output-schema smoke"
-SCHEMA_OUT="${TMP_DIR}/memory_patch_smoke.json"
-codex exec \
-  --ephemeral \
-  --sandbox read-only \
-  --skip-git-repo-check \
-  --json \
-  --output-last-message "${SCHEMA_OUT}" \
-  --output-schema "${MEMORY_DIR}/schemas/memory_patch.schema.json" \
-  -c features.codex_hooks=false \
-  -C "${REPO_ROOT}" \
-  "Return a noop patch plan that matches the schema. JSON only."
-python3 -m json.tool "${SCHEMA_OUT}" >/dev/null
+log_step "patch schema smoke"
+python3 -m json.tool "${MEMORY_DIR}/schemas/memory_patch.schema.json" >/dev/null
 
 log_step "command e2e on isolated memory home"
 "${MEMORY_DIR}/bin/memory-admin" --cwd "${WORKSPACE}" --memory-home "${E2E_HOME}" bootstrap >/dev/null

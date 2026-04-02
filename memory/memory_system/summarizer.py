@@ -2,17 +2,102 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-from pathlib import Path
-from tempfile import TemporaryDirectory
+from dataclasses import dataclass
 from typing import Any
 
 from .config import MemoryConfig
-from .constants import DEFAULT_PROMPT_VERSION, GLOBAL_SCOPE, LOCAL_RECENT_SCOPE, SCHEMA_DIR
+from .constants import DEFAULT_PROMPT_VERSION, GLOBAL_SCOPE, LOCAL_RECENT_SCOPE
+from .env_config import config_value, first_non_empty, load_dotenv_file, resolve_env_file
+from .errors import PatchApplyError, SummarizerExecutionError
 from .markdown_store import load_document
-from .patch_applier import PatchApplyError
 from .state_db import SummaryJob
-from .utils import isoformat
+
+DEFAULT_SUMMARIZER_MODEL = "qwen3-max"
+DEFAULT_SUMMARIZER_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_SUMMARIZER_ENDPOINT_MODE = "openai"
+DEFAULT_SUMMARIZER_TEMPERATURE = 0.0
+DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 120
+DEFAULT_SUMMARIZER_MAX_OUTPUT_TOKENS = 4096
+QWEN_BACKENDS = {"qwen"}
+LEGACY_BACKEND_ALIASES = {"codex": "qwen"}
+SUMMARIZER_SYSTEM_PROMPT = (
+    "你是本地记忆系统的总结器。"
+    "你的任务是根据当前对话增量和已有记忆，输出一个 JSON patch plan。"
+    "不要输出 Markdown，不要输出解释，只能输出一个 JSON 对象。"
+)
+
+
+@dataclass(slots=True)
+class SummarizerSettings:
+    provider: str = "auto"
+    model_name: str = DEFAULT_SUMMARIZER_MODEL
+    base_url: str | None = DEFAULT_SUMMARIZER_BASE_URL
+    api_key: str | None = None
+    endpoint_mode: str = DEFAULT_SUMMARIZER_ENDPOINT_MODE
+    timeout_seconds: int = DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
+    temperature: float = DEFAULT_SUMMARIZER_TEMPERATURE
+    max_output_tokens: int = DEFAULT_SUMMARIZER_MAX_OUTPUT_TOKENS
+
+
+def load_summarizer_settings(*, env_file: str | os.PathLike[str] | None = None) -> SummarizerSettings:
+    dotenv = load_dotenv_file(resolve_env_file(env_file))
+    provider = config_value("CODEX_MEMORY_SUMMARIZER_PROVIDER", dotenv, "auto").strip().lower() or "auto"
+    endpoint_mode = (
+        config_value(
+            "CODEX_MEMORY_SUMMARIZER_ENDPOINT_MODE",
+            dotenv,
+            DEFAULT_SUMMARIZER_ENDPOINT_MODE,
+        )
+        .strip()
+        .lower()
+        or DEFAULT_SUMMARIZER_ENDPOINT_MODE
+    )
+    return SummarizerSettings(
+        provider=provider,
+        model_name=(
+            config_value("CODEX_MEMORY_SUMMARIZER_MODEL", dotenv, DEFAULT_SUMMARIZER_MODEL).strip()
+            or DEFAULT_SUMMARIZER_MODEL
+        ),
+        base_url=first_non_empty(
+            config_value("CODEX_MEMORY_SUMMARIZER_BASE_URL", dotenv, None),
+            config_value("CODEX_MEMORY_EMBEDDING_BASE_URL", dotenv, None),
+            config_value("CODEX_MEMORY_SUMMARIZER_ENDPOINT", dotenv, None),
+            DEFAULT_SUMMARIZER_BASE_URL,
+        ),
+        api_key=first_non_empty(
+            config_value("CODEX_MEMORY_SUMMARIZER_API_KEY", dotenv, None),
+            config_value("CODEX_MEMORY_EMBEDDING_API_KEY", dotenv, None),
+        ),
+        endpoint_mode=endpoint_mode,
+        timeout_seconds=_parse_int_config(
+            config_value(
+                "CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS",
+                dotenv,
+                str(DEFAULT_SUMMARIZER_TIMEOUT_SECONDS),
+            ),
+            minimum=10,
+            default=DEFAULT_SUMMARIZER_TIMEOUT_SECONDS,
+        ),
+        temperature=_parse_float_config(
+            config_value(
+                "CODEX_MEMORY_SUMMARIZER_TEMPERATURE",
+                dotenv,
+                str(DEFAULT_SUMMARIZER_TEMPERATURE),
+            ),
+            minimum=0.0,
+            maximum=2.0,
+            default=DEFAULT_SUMMARIZER_TEMPERATURE,
+        ),
+        max_output_tokens=_parse_int_config(
+            config_value(
+                "CODEX_MEMORY_SUMMARIZER_MAX_OUTPUT_TOKENS",
+                dotenv,
+                str(DEFAULT_SUMMARIZER_MAX_OUTPUT_TOKENS),
+            ),
+            minimum=256,
+            default=DEFAULT_SUMMARIZER_MAX_OUTPUT_TOKENS,
+        ),
+    )
 
 
 def build_patch_prompt(
@@ -57,11 +142,14 @@ def build_patch_prompt(
         "策略：\n"
         "- 全局记忆仅保留可跨仓库复用的长期偏好与稳定约束。\n"
         "- 本地近期记忆保留仓库相关的阻塞项、TODO、失败结论和近期事实。\n"
+        "- 如果用户显式要求“记住下一步/下次继续/remember next step”，优先写入本地 open task_context。\n"
         "- local 记录应上升为全局时用 promote；全局记录实际是仓库私有时用 demote。\n"
         "- 不要写入密钥、原始工具日志或无依据推测。\n"
         "- 必须严格遵守 base_revisions。\n\n"
         "基础版本：\n"
         f"{json.dumps(base_revisions, indent=2, ensure_ascii=True)}\n\n"
+        "任务元数据：\n"
+        f"{json.dumps({'job_id': job.id, 'prompt_version': DEFAULT_PROMPT_VERSION}, indent=2, ensure_ascii=True)}\n\n"
         "输出要求：\n"
         "返回 patch plan，包含 decision、reason、base_revisions、global_ops、local_ops、needs_manual_review。\n"
         "允许动作：create、update、supersede、delete、pin、promote、demote。\n"
@@ -73,13 +161,14 @@ def summarize_job(
     config: MemoryConfig,
     job: SummaryJob,
     events: list[dict[str, Any]],
-    backend: str = "codex",
+    backend: str = "qwen",
 ) -> dict[str, Any]:
-    if backend == "heuristic":
+    resolved_backend = LEGACY_BACKEND_ALIASES.get(backend, backend)
+    if resolved_backend == "heuristic":
         return heuristic_patch_plan(config=config, events=events)
-    if backend != "codex":
+    if resolved_backend not in QWEN_BACKENDS:
         raise PatchApplyError(f"unknown summarizer backend: {backend}")
-    return _run_codex_exec(config=config, job=job, events=events)
+    return _run_qwen_completion(config=config, job=job, events=events)
 
 
 def heuristic_patch_plan(*, config: MemoryConfig, events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -132,69 +221,104 @@ def heuristic_patch_plan(*, config: MemoryConfig, events: list[dict[str, Any]]) 
     }
 
 
-def _run_codex_exec(*, config: MemoryConfig, job: SummaryJob, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _run_qwen_completion(*, config: MemoryConfig, job: SummaryJob, events: list[dict[str, Any]]) -> dict[str, Any]:
+    import requests
+
+    settings = load_summarizer_settings()
+    if settings.provider not in {"auto", "qwen_openai"}:
+        raise SummarizerExecutionError(f"unsupported summarizer provider: {settings.provider}")
+    if not _remote_summarizer_enabled(settings):
+        raise SummarizerExecutionError(
+            "Qwen summarizer is not configured. Set CODEX_MEMORY_SUMMARIZER_API_KEY "
+            "or switch the worker backend to heuristic."
+        )
     prompt = build_patch_prompt(config=config, job=job, events=events)
-    schema_path = SCHEMA_DIR / "memory_patch.schema.json"
-    with TemporaryDirectory(prefix="memoryd-") as temp_dir:
-        temp_root = Path(temp_dir)
-        prompt_path = temp_root / "prompt.txt"
-        result_path = temp_root / "result.json"
-        run_log_path = temp_root / "run.jsonl"
-        prompt_path.write_text(prompt, encoding="utf-8")
-        env = os.environ.copy()
-        env.pop("CODEX_THREAD_ID", None)
-        env.pop("CODEX_SESSION_ID", None)
-        command = [
-            "codex",
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--json",
-            "--output-last-message",
-            str(result_path),
-            "--output-schema",
-            str(schema_path),
-            "-c",
-            "features.codex_hooks=false",
-            "-C",
-            str(config.workspace_root),
-            "-",
-        ]
-        with prompt_path.open("r", encoding="utf-8") as handle, run_log_path.open(
-            "w", encoding="utf-8"
-        ) as run_log:
-            completed = subprocess.run(
-                command,
-                stdin=handle,
-                stdout=run_log,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                check=False,
-            )
-        if completed.returncode != 0:
-            raise PatchApplyError(
-                f"codex exec summarizer failed with exit code {completed.returncode}: {completed.stderr.strip()}"
-            )
-        return _normalize_model_patch_plan(json.loads(result_path.read_text(encoding="utf-8")))
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.api_key}",
+    }
+    payload: dict[str, Any] = {
+        "model": settings.model_name,
+        "messages": [
+            {"role": "system", "content": SUMMARIZER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": settings.temperature,
+        "max_tokens": settings.max_output_tokens,
+    }
+    try:
+        response = requests.post(
+            _summarizer_request_url(settings),
+            json=payload,
+            headers=headers,
+            timeout=settings.timeout_seconds,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise SummarizerExecutionError(f"qwen summarizer request failed: {exc}") from exc
+    try:
+        content = _extract_completion_content(response.json())
+        patch_plan = _parse_patch_plan_payload(content)
+    except SummarizerExecutionError:
+        raise
+    except Exception as exc:
+        raise SummarizerExecutionError(f"qwen summarizer response parse failed: {exc}") from exc
+    return _normalize_model_patch_plan(patch_plan)
 
 
 def _normalize_model_patch_plan(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     normalized["global_ops"] = [_normalize_model_op(op) for op in payload.get("global_ops", [])]
     normalized["local_ops"] = [_normalize_model_op(op) for op in payload.get("local_ops", [])]
+    normalized["decision"] = _normalize_decision(normalized.get("decision"), payload=normalized)
     return normalized
 
 
 def _normalize_model_op(op: dict[str, Any]) -> dict[str, Any]:
     cleaned = {key: value for key, value in op.items() if value is not None}
+    action = cleaned.get("action")
+    if isinstance(cleaned.get("id"), str) and "target_id" not in cleaned:
+        cleaned["target_id"] = cleaned.pop("id")
+    if isinstance(cleaned.get("fields"), dict):
+        if action == "create" and "record" not in cleaned:
+            cleaned["record"] = cleaned.pop("fields")
+        elif action == "update" and "record_patch" not in cleaned:
+            cleaned["record_patch"] = cleaned.pop("fields")
+    if isinstance(cleaned.get("replacement"), dict) and "replacement_record" not in cleaned:
+        cleaned["replacement_record"] = cleaned.pop("replacement")
+    if action == "delete" and "tombstone" not in cleaned and isinstance(cleaned.get("reason"), str):
+        cleaned["tombstone"] = {"reason": cleaned.pop("reason"), "source_refs": []}
+    if action == "pin" and "pin" not in cleaned and isinstance(cleaned.get("pin_until"), str):
+        cleaned["pin"] = {"pin_until": cleaned.pop("pin_until")}
     for field in ("record", "record_patch", "replacement_record", "tombstone", "pin"):
         value = cleaned.get(field)
         if isinstance(value, dict):
-            cleaned[field] = {nested_key: nested_value for nested_key, nested_value in value.items() if nested_value is not None}
+            cleaned[field] = {
+                nested_key: nested_value
+                for nested_key, nested_value in value.items()
+                if nested_value is not None
+            }
     return cleaned
+
+
+def _normalize_decision(decision: Any, *, payload: dict[str, Any]) -> str:
+    if decision == "noop":
+        return "noop"
+    if decision == "write":
+        return "write"
+    if isinstance(decision, str) and decision in {
+        "create",
+        "update",
+        "supersede",
+        "delete",
+        "pin",
+        "promote",
+        "demote",
+    }:
+        return "write"
+    if payload.get("global_ops") or payload.get("local_ops"):
+        return "write"
+    return "noop"
 
 
 def _extract_next_step(combined: str, *, lowered: str | None = None) -> str | None:
@@ -217,3 +341,90 @@ def _extract_next_step(combined: str, *, lowered: str | None = None) -> str | No
         if start >= 0:
             return combined[start + len(marker) :].strip() or None
     return None
+
+
+def _remote_summarizer_enabled(settings: SummarizerSettings) -> bool:
+    if not settings.base_url:
+        return False
+    if settings.endpoint_mode == "openai" and not settings.api_key:
+        return False
+    return True
+
+
+def _summarizer_request_url(settings: SummarizerSettings) -> str:
+    if not settings.base_url:
+        raise SummarizerExecutionError("Qwen summarizer base URL is not configured")
+    url = settings.base_url.rstrip("/")
+    if settings.endpoint_mode == "openai":
+        return url if url.endswith("/chat/completions") else f"{url}/chat/completions"
+    return url
+
+
+def _extract_completion_content(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise SummarizerExecutionError(f"unsupported completion response shape: {_truncate_json(payload)}")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise SummarizerExecutionError(f"completion response is missing message: {_truncate_json(payload)}")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if parts:
+            return "".join(parts)
+    raise SummarizerExecutionError(f"completion response is missing text content: {_truncate_json(payload)}")
+
+
+def _parse_patch_plan_payload(content: str) -> dict[str, Any]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = _strip_code_fences(cleaned)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise SummarizerExecutionError(f"summarizer did not return JSON: {cleaned[:400]}")
+        try:
+            payload = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise SummarizerExecutionError(f"summarizer returned invalid JSON: {cleaned[:400]}") from exc
+    if not isinstance(payload, dict):
+        raise SummarizerExecutionError("summarizer payload must be a JSON object")
+    return payload
+
+
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```json"):
+        stripped = stripped[len("```json") :]
+    elif stripped.startswith("```"):
+        stripped = stripped[len("```") :]
+    if stripped.endswith("```"):
+        stripped = stripped[:-3]
+    return stripped.strip()
+
+
+def _truncate_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)[:300]
+
+
+def _parse_int_config(raw: str, *, minimum: int, default: int) -> int:
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float_config(raw: str, *, minimum: float, maximum: float, default: float) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))

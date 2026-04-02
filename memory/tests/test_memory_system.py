@@ -29,7 +29,8 @@ from memory_system.patch_applier import apply_patch_plan, current_base_revisions
 from memory_system.record_store import find_record
 from memory_system.search_index import SearchIndex, search_old_records
 from memory_system.snapshot import build_snapshot
-from memory_system.state_db import StateDB
+from memory_system.state_db import StateDB, SummaryJob
+from memory_system.summarizer import load_summarizer_settings, summarize_job
 from memory_system.worker import run_worker_once
 
 
@@ -557,7 +558,7 @@ class MemorySystemTest(unittest.TestCase):
                 "assistant_message_delta": "noted",
             },
         )
-        transient_error = SummarizerExecutionError("temporary codex backend failure")
+        transient_error = SummarizerExecutionError("temporary qwen backend failure")
         successful_patch = {
             "decision": "write",
             "reason": "retry success",
@@ -587,7 +588,7 @@ class MemorySystemTest(unittest.TestCase):
             first = run_worker_once(
                 str(self.workspace),
                 memory_home=str(self.memory_home),
-                backend="codex",
+                backend="qwen",
                 retry_base_seconds=0,
             )
             self.assertEqual(first["retry_status"]["status"], "retry_wait")
@@ -601,17 +602,268 @@ class MemorySystemTest(unittest.TestCase):
                 state.close()
             self.assertEqual(row[0], "retry_wait")
             self.assertEqual(row[1], 1)
-            self.assertIn("temporary codex backend failure", row[2])
+            self.assertIn("temporary qwen backend failure", row[2])
 
             second = run_worker_once(
                 str(self.workspace),
                 memory_home=str(self.memory_home),
-                backend="codex",
+                backend="qwen",
                 retry_base_seconds=0,
             )
         self.assertTrue(second["applied"])
         snapshot = build_snapshot(self.config)
         self.assertIn("retry auth snapshot flow", snapshot.rendered_text)
+
+    def test_qwen_summarizer_settings_load_from_dotenv_file(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=from-dotenv",
+                "CODEX_MEMORY_SUMMARIZER_MODEL=qwen3-max",
+                "CODEX_MEMORY_SUMMARIZER_ENDPOINT_MODE=openai",
+                "CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS=90",
+                "CODEX_MEMORY_SUMMARIZER_TEMPERATURE=0.2",
+                "CODEX_MEMORY_SUMMARIZER_MAX_OUTPUT_TOKENS=2048",
+            ]
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = load_summarizer_settings(env_file=env_file)
+
+        self.assertEqual(settings.provider, "qwen_openai")
+        self.assertEqual(settings.base_url, "https://example.com/compatible-mode/v1")
+        self.assertEqual(settings.api_key, "from-dotenv")
+        self.assertEqual(settings.model_name, "qwen3-max")
+        self.assertEqual(settings.endpoint_mode, "openai")
+        self.assertEqual(settings.timeout_seconds, 90)
+        self.assertAlmostEqual(settings.temperature, 0.2)
+        self.assertEqual(settings.max_output_tokens, 2048)
+
+    def test_environment_overrides_dotenv_summarizer_settings(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://dotenv.example/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=from-dotenv",
+                "CODEX_MEMORY_SUMMARIZER_MODEL=qwen3-max",
+                "CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS=90",
+            ]
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER": "auto",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL": "https://env.example/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY": "from-env",
+                "CODEX_MEMORY_SUMMARIZER_MODEL": "qwen3-max-preview",
+                "CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS": "45",
+            },
+            clear=True,
+        ):
+            settings = load_summarizer_settings(env_file=env_file)
+
+        self.assertEqual(settings.provider, "auto")
+        self.assertEqual(settings.base_url, "https://env.example/v1")
+        self.assertEqual(settings.api_key, "from-env")
+        self.assertEqual(settings.model_name, "qwen3-max-preview")
+        self.assertEqual(settings.timeout_seconds, 45)
+
+    def test_summarizer_settings_can_reuse_embedding_connection_defaults(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_EMBEDDING_BASE_URL=https://embedding.example/v1",
+                "CODEX_MEMORY_EMBEDDING_API_KEY=shared-token",
+            ]
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = load_summarizer_settings(env_file=env_file)
+
+        self.assertEqual(settings.base_url, "https://embedding.example/v1")
+        self.assertEqual(settings.api_key, "shared-token")
+        self.assertEqual(settings.model_name, "qwen3-max")
+
+    def test_qwen_summarizer_uses_openai_compatible_chat_api(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+                "CODEX_MEMORY_SUMMARIZER_MODEL=qwen3-max",
+                "CODEX_MEMORY_SUMMARIZER_ENDPOINT_MODE=openai",
+                "CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS=30",
+                "CODEX_MEMORY_SUMMARIZER_MAX_OUTPUT_TOKENS=1024",
+            ]
+        )
+        captured_requests: list[tuple[str, dict[str, object], dict[str, str], int]] = []
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "write",
+                                "reason": "detected explicit next step",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "create",
+                                        "record": {
+                                            "type": "task_context",
+                                            "status": "open",
+                                            "confidence": "high",
+                                            "subject": "下一步",
+                                            "summary": "重新检查失败的 auth 快照",
+                                            "tags": ["todo", "auth"],
+                                            "source_refs": ["transcript_delta"],
+                                            "scope_reason": "repo-specific and near-term",
+                                        },
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured_requests.append((url, json, headers, timeout))
+            return FakeResponse()
+
+        job = SummaryJob(
+            id=1,
+            job_key="job-key",
+            session_id="session-qwen",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            side_effect=fake_post,
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住下一步：重新检查失败的 auth 快照", "assistant_message_delta": "好"}],
+                backend="qwen",
+            )
+
+        self.assertEqual(patch_plan["decision"], "write")
+        self.assertEqual(captured_requests[0][0], "https://example.com/compatible-mode/v1/chat/completions")
+        self.assertEqual(captured_requests[0][2]["Authorization"], "Bearer test-token")
+        self.assertEqual(captured_requests[0][3], 30)
+        self.assertEqual(captured_requests[0][1]["model"], "qwen3-max")
+        self.assertEqual(captured_requests[0][1]["max_tokens"], 1024)
+        messages = captured_requests[0][1]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("记住下一步", messages[1]["content"])
+
+    def test_qwen_summarizer_normalizes_common_alias_fields(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "update",
+                                "reason": "refresh existing task",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "update",
+                                        "id": "l_existing_task",
+                                        "fields": {"status": "open", "updated_at": "2026-04-02T12:47:36Z"},
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=2,
+            job_key="job-key-2",
+            session_id="session-qwen-2",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住下一步：重新检查失败的 auth 快照", "assistant_message_delta": "好"}],
+                backend="qwen",
+            )
+
+        self.assertEqual(patch_plan["decision"], "write")
+        self.assertEqual(patch_plan["local_ops"][0]["target_id"], "l_existing_task")
+        self.assertEqual(patch_plan["local_ops"][0]["record_patch"]["status"], "open")
 
     def test_worker_gc_deletes_old_runtime_snapshots_and_finished_jobs(self) -> None:
         old_runtime = self.config.runtime_dir / "session_old.json"
@@ -835,7 +1087,7 @@ class MemorySystemTest(unittest.TestCase):
         self.assertTrue(vector)
         self.assertFalse(post_mock.called)
 
-    def test_patch_schema_is_codex_compatible_flat_transport_schema(self) -> None:
+    def test_patch_schema_is_flat_transport_schema(self) -> None:
         schema = json.loads((ROOT / "schemas" / "memory_patch.schema.json").read_text(encoding="utf-8"))
         self.assertIn("op", schema.get("$defs", {}))
         self.assertNotIn("oneOf", schema["$defs"]["op"])

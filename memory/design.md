@@ -8,7 +8,7 @@
 2. 自动总结：
 
    * 在每轮结束后评估是否需要做记忆总结。
-   * 真正的总结由独立 worker 用 `codex exec` 完成，不在 hook 内直接做。
+   * 真正的总结由独立 worker 调用独立的 Qwen summarizer 完成，不在 hook 内直接做。
 3. 可修订：
 
    * 新总结可以新增、更新、废弃、提升/降级旧记忆。
@@ -41,7 +41,7 @@ Codex
 
 memoryd（常驻）
   ├─ 轮询队列 / 维护状态
-  ├─ 触发 codex exec summarizer（hooks 关闭、只读、ephemeral）
+  ├─ 调用 Qwen3-Max summarizer（独立 API 调用，不走 nested Codex 会话）
   ├─ 拿到结构化 patch plan
   ├─ deterministic patch applier 落盘到 Markdown
   ├─ 触发 embedding / BM25 索引更新
@@ -535,51 +535,50 @@ Stop hook 只做轻量判断：
 
 ---
 
-# 8. `codex exec` 总结器：必须由独立 worker 拉起
+# 8. Qwen 总结器：必须由独立 worker 拉起
 
 这是最关键的架构决定：
 
-**不要从 hook 进程里直接 `codex exec`。**
-要由 `memoryd` 这样的独立 worker，读取队列后在 hook 之外启动 `codex exec`。
+**不要从 hook 进程里直接调模型。**
+要由 `memoryd` 这样的独立 worker，读取队列后在 hook 之外调用独立 summarizer。
 
 理由有三条：
 
 1. hook 本身应该是短任务；长模型调用会把 turn latency 放大。
-2. nested `codex exec` 目前有公开 issue，子 exec 里的命令仍可能看到父 `CODEX_THREAD_ID`。
-3. 你需要关闭 nested exec 自己的 hooks，否则会递归触发 memory hook。([GitHub][5])
+2. 记忆总结不应该依赖当前 Codex 会话本身，否则会把运行时耦合进记忆控制面。
+3. 只有把模型调用放到 hook 外，才能把重试、超时、审计和降级策略统一收敛到 worker。
 
 ## 8.1 worker 启动命令
 
-`codex exec` 是稳定的非交互模式，支持 `--ephemeral`、`--json`、`--output-schema`、`--sandbox` 以及 `-c key=value` 覆盖；默认可以只读跑，也可把最终消息写到文件。([OpenAI Developers][6])
+当前实现不再使用 `codex exec`。worker 直接调用与 embedding 分离配置的 summarizer API，默认使用北京站 OpenAI-compatible endpoint 上的 `qwen3-max`。
 
-推荐命令：
+等价的请求意图如下：
 
-```bash
-env -u CODEX_THREAD_ID -u CODEX_SESSION_ID \
-codex exec \
-  --ephemeral \
-  --sandbox read-only \
-  --skip-git-repo-check \
-  --json \
-  --output-last-message /tmp/memory_patch_result.json \
-  --output-schema ~/.codex/memory/control/schemas/memory_patch.schema.json \
-  -c features.codex_hooks=false \
-  -C "$WORKSPACE_ROOT" \
-  - < /tmp/memory_patch_prompt.txt > /tmp/memory_patch_run.jsonl
+```text
+POST ${CODEX_MEMORY_SUMMARIZER_BASE_URL}/chat/completions
+Authorization: Bearer ${CODEX_MEMORY_SUMMARIZER_API_KEY}
+
+{
+  "model": "qwen3-max",
+  "messages": [
+    {"role": "system", "content": "你是本地记忆系统的总结器，只输出 JSON 对象。"},
+    {"role": "user", "content": "<memory patch prompt>"}
+  ],
+  "temperature": 0,
+  "max_tokens": 4096
+}
 ```
 
 这里的设计意图是：
 
-* `--ephemeral`：不把 summarizer 自己的 rollout 落盘
-* `--sandbox read-only`：总结器不应该直接改文件
-* `--json`：保留完整审计流
-* `--output-schema`：强制输出结构化 patch plan
-* `--output-last-message`：拿到最终 JSON 结果
-* `-c features.codex_hooks=false`：防止递归 hook
+* summarizer 与 Codex 主会话解耦：不再依赖 nested session
+* 模型只返回 JSON patch plan：不允许直接写文件
+* API 配置独立：`CODEX_MEMORY_SUMMARIZER_*` 与 `CODEX_MEMORY_EMBEDDING_*` 分离
+* deterministic applier 仍然是唯一落盘入口
 
 ## 8.2 summarizer 输入包
 
-worker 生成给 Codex 的 prompt，不要裸喂 transcript。输入包应该固定六段：
+worker 生成给 summarizer 的 prompt，不要裸喂 transcript。输入包应该固定六段：
 
 1. **Task brief**
    你是 memory summarizer，只能输出 JSON，不得直接改文件。
@@ -589,8 +588,8 @@ worker 生成给 Codex 的 prompt，不要裸喂 transcript。输入包应该固
 4. **Current active local recent memory**
 5. **Policy**
    什么能记、什么不能记、如何分类、如何处理冲突
-6. **Output schema**
-   严格 JSON schema
+6. **Output contract**
+   必须返回单个 JSON patch plan 对象
 
 ## 8.3 summarizer 输出 schema
 
@@ -598,7 +597,7 @@ worker 生成给 Codex 的 prompt，不要裸喂 transcript。输入包应该固
 
 语义上必须按 action 区分，不能把所有 action 当成一坨宽松写法来解释；并且必须带上 base revision，避免并发时把过期 patch 直接写盘。
 
-但当前 `codex exec --output-schema` 对 JSON schema 的约束更严格：它不接受 `oneOf` 这类判别联合写法，而且要求 object 的 `required` 覆盖全部 `properties`。因此 V1 的**传输层 schema**会保持 Codex 兼容的扁平 nullable 结构，而**服务端 validation / applier**继续按 action 语义做严格校验。
+当前实现不再依赖 `codex exec --output-schema`，但 V1 仍保留扁平 transport schema，服务端 validation / applier 继续按 action 语义做严格校验。这样模型输出的兼容面更宽，而真正的写盘约束仍然是 deterministic 的。
 
 ```json
 {
@@ -702,7 +701,7 @@ worker 生成给 Codex 的 prompt，不要裸喂 transcript。输入包应该固
 }
 ```
 
-上面的 JSON 只是“语义示例”，为了可读性省略了与当前 action 无关的 `null` 字段。实际给 `codex exec --output-schema` 的传输 schema 会要求这些字段显式存在，再由 server-side normalizer 把 `null` 清掉。
+上面的 JSON 只是“语义示例”，为了可读性省略了与当前 action 无关的 `null` 字段。实际落地的传输 schema 仍要求这些字段显式存在，再由 server-side normalizer 把 `null` 清掉。
 
 补充约束：
 
@@ -1050,15 +1049,15 @@ job_key = sha256(session_id + transcript_path + start_cursor + end_cursor + prom
 
 不要让 `PostToolUse` 参与“是否生成记忆”的核心判定；它最多做辅助遥测。当前公开 issue 已有长 running shell completion 丢失 post hook 的报告。([GitHub][10])
 
-## 13.5 nested `codex exec` 污染
+## 13.5 hook 外独立 summarizer
 
-worker 启动 summarizer 前：
+summarizer 必须由 hook 外 worker 拉起，不在 hook 进程里直接调模型。
 
-* `unset CODEX_THREAD_ID`
-* `unset CODEX_SESSION_ID`
-* `-c features.codex_hooks=false`
+这样可以避免：
 
-并且 summarizer 必须由 hook 外 worker 拉起，不在 hook 进程里直接 exec。([GitHub][5])
+* hook latency 被远程模型调用放大
+* 会话运行时和记忆控制面耦合
+* 重试 / 降级 / 审计逻辑散落在 hook 里
 
 ## 13.6 subagent 问题
 
@@ -1103,12 +1102,12 @@ hook 输入里的 `transcript_path` 可能为 null，所以状态库里要额外
 8. deterministic selection + token budget truncation
 9. queue + idle debounce
 
-## Phase 2：再做 codex exec summarizer
+## Phase 2：再做 Qwen summarizer
 
 1. prompt packer
 2. JSON schema
 3. append-only event log reader
-4. exec worker
+4. qwen worker client
 5. patch applier with base revision check
 6. audit log
 7. rollback / retry
@@ -1129,7 +1128,7 @@ hook 输入里的 `transcript_path` 可能为 null，所以状态库里要额外
 如果你让我只保留三条最重要的工程原则，就是这三条：
 
 1. **真实加载点放在 `UserPromptSubmit`，`SessionStart` 只预热。**
-2. **真正的记忆总结由独立 worker 用 `codex exec --output-schema` 做，hook 只排队。**
+2. **真正的记忆总结由独立 worker 调用 Qwen summarizer 做，hook 只排队。**
 3. **模型只输出结构化 patch plan，真正写 Markdown 的必须是 deterministic applier。**
 
 这三条定住了，你的系统效果和稳定性会比“hook 里直接总结 + 直接改文件”高一个量级。
@@ -1145,8 +1144,6 @@ hook 输入里的 `transcript_path` 可能为 null，所以状态库里要额外
 [2]: https://docs.openclaw.ai/concepts/memory "Memory Overview - OpenClaw"
 [3]: https://docs.openclaw.ai/concepts/memory-search "https://docs.openclaw.ai/concepts/memory-search"
 [4]: https://github.com/openai/codex/issues/15266 "UserPromptSubmit and SessionStart hooks fire simultaneously on first prompt · Issue #15266 · openai/codex · GitHub"
-[5]: https://github.com/openai/codex/issues/15527 "Nested codex exec commands inherit parent CODEX_THREAD_ID instead of nested thread id · Issue #15527 · openai/codex · GitHub"
-[6]: https://developers.openai.com/codex/noninteractive/ "https://developers.openai.com/codex/noninteractive/"
 [7]: https://developers.openai.com/codex/mcp/ "Model Context Protocol – Codex | OpenAI Developers"
 [8]: https://developers.openai.com/codex/guides/agents-md/ "Custom instructions with AGENTS.md – Codex | OpenAI Developers"
 [9]: https://github.com/QwenLM/Qwen3-Embedding "GitHub - QwenLM/Qwen3-Embedding · GitHub"

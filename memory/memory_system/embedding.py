@@ -6,9 +6,9 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Iterable
 
+from .env_config import config_value, first_non_empty, load_dotenv_file, resolve_env_file
 from .utils import sha256_text
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-./]{1,}")
@@ -24,9 +24,6 @@ QUERY_INSTRUCTION = (
     "为检索开发工作区归档记忆表示这个查询。"
     " Represent this query for retrieving archived developer-workspace memory."
 )
-DEFAULT_ENV_FILE_NAME = ".env"
-
-
 @dataclass(slots=True)
 class EmbeddingSettings:
     provider: str = "auto"
@@ -39,25 +36,25 @@ class EmbeddingSettings:
 
 
 def load_embedding_settings(*, env_file: str | os.PathLike[str] | None = None) -> EmbeddingSettings:
-    dotenv = _load_dotenv_file(_resolve_env_file(env_file))
-    provider = _config_value("CODEX_MEMORY_EMBEDDING_PROVIDER", dotenv, "auto").strip().lower() or "auto"
-    endpoint_mode = _config_value("CODEX_MEMORY_EMBEDDING_ENDPOINT_MODE", dotenv, "tei").strip().lower() or "tei"
-    max_length_raw = _config_value("CODEX_MEMORY_EMBEDDING_MAX_LENGTH", dotenv, str(DEFAULT_QWEN_MAX_LENGTH))
+    dotenv = load_dotenv_file(resolve_env_file(env_file))
+    provider = config_value("CODEX_MEMORY_EMBEDDING_PROVIDER", dotenv, "auto").strip().lower() or "auto"
+    endpoint_mode = config_value("CODEX_MEMORY_EMBEDDING_ENDPOINT_MODE", dotenv, "tei").strip().lower() or "tei"
+    max_length_raw = config_value("CODEX_MEMORY_EMBEDDING_MAX_LENGTH", dotenv, str(DEFAULT_QWEN_MAX_LENGTH))
     try:
         max_length = max(128, int(max_length_raw))
     except ValueError:
         max_length = DEFAULT_QWEN_MAX_LENGTH
-    dimensions_raw = _config_value("CODEX_MEMORY_EMBEDDING_DIMENSIONS", dotenv, str(DEFAULT_REMOTE_DIMENSIONS))
+    dimensions_raw = config_value("CODEX_MEMORY_EMBEDDING_DIMENSIONS", dotenv, str(DEFAULT_REMOTE_DIMENSIONS))
     dimensions = _parse_embedding_dimensions(dimensions_raw)
     return EmbeddingSettings(
         provider=provider,
-        model_name=_config_value("CODEX_MEMORY_EMBEDDING_MODEL", dotenv, DEFAULT_QWEN_MODEL).strip() or DEFAULT_QWEN_MODEL,
-        base_url=_first_non_empty(
-            _config_value("CODEX_MEMORY_EMBEDDING_BASE_URL", dotenv, None),
-            _config_value("CODEX_MEMORY_EMBEDDING_ENDPOINT", dotenv, None),  # backward compatibility
+        model_name=config_value("CODEX_MEMORY_EMBEDDING_MODEL", dotenv, DEFAULT_QWEN_MODEL).strip() or DEFAULT_QWEN_MODEL,
+        base_url=first_non_empty(
+            config_value("CODEX_MEMORY_EMBEDDING_BASE_URL", dotenv, None),
+            config_value("CODEX_MEMORY_EMBEDDING_ENDPOINT", dotenv, None),  # backward compatibility
         ),
-        api_key=_first_non_empty(
-            _config_value("CODEX_MEMORY_EMBEDDING_API_KEY", dotenv, None),
+        api_key=first_non_empty(
+            config_value("CODEX_MEMORY_EMBEDDING_API_KEY", dotenv, None),
         ),
         endpoint_mode=endpoint_mode,
         max_length=max_length,
@@ -255,76 +252,6 @@ def _last_token_pool(last_hidden_states, attention_mask, torch_module):
     sequence_lengths = attention_mask.sum(dim=1) - 1
     batch_size = last_hidden_states.shape[0]
     return last_hidden_states[torch_module.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
-
-
-def _memory_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _resolve_env_file(env_file: str | os.PathLike[str] | None) -> Path:
-    if env_file is None:
-        configured = os.environ.get("CODEX_MEMORY_ENV_FILE", "").strip()
-        if configured:
-            env_file = configured
-        else:
-            return _memory_root() / DEFAULT_ENV_FILE_NAME
-    path = Path(env_file).expanduser()
-    if path.is_absolute():
-        return path
-    return (Path.cwd() / path).resolve()
-
-
-def _load_dotenv_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].lstrip()
-        if "=" not in line:
-            continue
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        if not key:
-            continue
-        values[key] = _parse_dotenv_value(raw_value.strip())
-    return values
-
-
-def _parse_dotenv_value(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        inner = value[1:-1]
-        if value[0] == '"':
-            return bytes(inner, "utf-8").decode("unicode_escape")
-        return inner
-    if " #" in value:
-        value = value.split(" #", 1)[0].rstrip()
-    return value
-
-
-def _config_value(name: str, dotenv: dict[str, str], default: str | None) -> str:
-    if name in os.environ:
-        return os.environ[name]
-    if name in dotenv:
-        return dotenv[name]
-    return default or ""
-
-
-def _first_non_empty(*values: str | None) -> str | None:
-    for value in values:
-        if value is None:
-            continue
-        stripped = value.strip()
-        if stripped:
-            return stripped
-    return None
-
-
 def _embedding_request_url(settings: EmbeddingSettings) -> str:
     if not settings.base_url:
         raise RuntimeError("Qwen base URL is not configured")

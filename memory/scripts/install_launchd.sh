@@ -9,10 +9,9 @@ MEMORY_DIR="${REPO_ROOT}/memory"
 LABEL="com.micrott.memoryd"
 WORKSPACE="${REPO_ROOT}"
 MEMORY_HOME="${CODEX_MEMORY_HOME:-}"
-BACKEND="codex"
+BACKEND="qwen"
 POLL_INTERVAL="5"
 PYTHON_BIN="$(command -v python3 || true)"
-CODEX_BIN="$(command -v codex || true)"
 DRY_RUN=0
 
 usage() {
@@ -24,10 +23,9 @@ Options:
   --label <label>               LaunchAgent label (default: com.micrott.memoryd)
   --workspace <path>            Workspace root (default: repo root)
   --memory-home <path>          Memory home; default derives from memory-admin bootstrap
-  --backend <codex|heuristic>   Worker backend (default: codex)
+  --backend <qwen|heuristic>    Worker backend (default: qwen)
   --poll-interval <seconds>     Poll interval (default: 5)
   --python-bin <path>           Python interpreter for launchd (default: current python3)
-  --codex-bin <path>            Codex binary path for PATH injection (default: command -v codex)
   --dry-run                     Print planned plist without installing
   -h, --help                    Show help
 EOF
@@ -59,10 +57,6 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
-    --codex-bin)
-      CODEX_BIN="$2"
-      shift 2
-      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -91,11 +85,6 @@ if [[ -z "${MEMORY_HOME}" ]]; then
   )"
 fi
 
-if [[ "${BACKEND}" == "codex" && -z "${CODEX_BIN}" ]]; then
-  echo "codex binary not found in PATH. Use --codex-bin or switch --backend heuristic." >&2
-  exit 1
-fi
-
 append_path() {
   local candidate="$1"
   if [[ -z "${candidate}" ]]; then
@@ -113,9 +102,6 @@ append_path() {
 
 PATH_ENV=""
 append_path "$(dirname "${PYTHON_BIN}")"
-if [[ -n "${CODEX_BIN}" ]]; then
-  append_path "$(dirname "${CODEX_BIN}")"
-fi
 append_path "/opt/homebrew/bin"
 append_path "/usr/local/bin"
 append_path "/usr/bin"

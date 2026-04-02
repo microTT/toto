@@ -26,7 +26,7 @@ def run_worker_once(
     cwd: str | None = None,
     *,
     memory_home: str | None = None,
-    backend: str = "codex",
+    backend: str = "qwen",
     retry_base_seconds: int = DEFAULT_JOB_RETRY_BASE_SECONDS,
     running_job_timeout_seconds: int = DEFAULT_RUNNING_JOB_TIMEOUT_SECONDS,
     completed_job_retention_days: int = DEFAULT_COMPLETED_JOB_RETENTION_DAYS,

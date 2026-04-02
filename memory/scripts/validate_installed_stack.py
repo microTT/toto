@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
-import sys
+import time
 from pathlib import Path
 
 
@@ -22,27 +23,52 @@ def run(argv: list[str] | None = None) -> int:
     hook_path = repo_root / "memory" / "bin" / "memory-hook"
     mcp_path = repo_root / "memory" / "bin" / "memory-mcp"
     memoryd_path = repo_root / "memory" / "bin" / "memoryd"
+    admin_path = repo_root / "memory" / "bin" / "memory-admin"
+    session_id = f"memory-live-check-session-{int(time.time())}"
+    env = _hook_env(memory_home)
 
     checks: list[dict[str, object]] = []
     checks.append(_check_installed_config(hook_path, mcp_path, memory_home))
     checks.append(_check_mcp_stdio(mcp_path, workspace, memory_home))
+    checks.append(_run_hook(hook_path, "session-start", _base_hook_payload(session_id, workspace, "turn-0"), env=env))
     checks.append(
-        _run_codex_exec(
+        _run_user_prompt_submit(
+            hook_path,
             workspace,
-            "Remember next step: revisit the failing auth snapshot. This is repo-specific and near-term. Reply with exactly ack.",
-            expected_last_message="ack",
-            expected_hooks=["SessionStart Completed", "UserPromptSubmit Completed", "Stop Completed"],
+            session_id=session_id,
+            turn_id="turn-1",
+            prompt="请加载当前仓库记忆。",
+            env=env,
+            expected_substrings=["记忆已加载", "工作区近期记忆"],
+            name="hook:user-prompt-submit:prewarm",
         )
     )
-    checks.append(_run_worker(memoryd_path, workspace, memory_home))
     checks.append(
-        _run_codex_exec(
-            workspace,
-            "What is the remembered next step for this repository? Reply with exactly the task phrase and nothing else.",
-            expected_last_message=args.expected_task,
-            expected_hooks=["SessionStart Completed", "UserPromptSubmit Completed", "Stop Completed"],
+        _run_hook(
+            hook_path,
+            "stop",
+            {
+                **_base_hook_payload(session_id, workspace, "turn-2"),
+                "user_message_delta": "记住下一步：重新检查失败的 auth 快照。",
+                "assistant_message_delta": "已记录。",
+            },
+            env=env,
         )
     )
+    checks.append(_run_worker(memoryd_path, workspace, memory_home, target_session_id=session_id))
+    checks.append(
+        _run_user_prompt_submit(
+            hook_path,
+            workspace,
+            session_id=session_id,
+            turn_id="turn-3",
+            prompt="当前仓库记住的下一步是什么？",
+            env=env,
+            expected_substrings=[args.expected_task],
+            name="hook:user-prompt-submit:post-summary",
+        )
+    )
+    checks.append(_check_context(admin_path, workspace, memory_home, expected_substring=args.expected_task))
     print(json.dumps({"ok": True, "checks": checks}, indent=2, ensure_ascii=False))
     return 0
 
@@ -115,77 +141,139 @@ def _check_mcp_stdio(mcp_path: Path, workspace: Path, memory_home: Path) -> dict
     return {"name": "mcp_stdio", "ok": True}
 
 
-def _run_codex_exec(
-    workspace: Path,
-    prompt: str,
+def _run_hook(
+    hook_path: Path,
+    command: str,
+    payload: dict[str, object],
     *,
-    expected_last_message: str,
-    expected_hooks: list[str],
+    env: dict[str, str],
 ) -> dict[str, object]:
-    last_message_path = Path("/tmp") / f"memory-live-{abs(hash(prompt))}.txt"
     completed = subprocess.run(
-        [
-            "codex",
-            "exec",
-            "-C",
-            str(workspace),
-            "--sandbox",
-            "workspace-write",
-            "--output-last-message",
-            str(last_message_path),
-            prompt,
-        ],
+        [str(hook_path), command],
+        input=json.dumps(payload, ensure_ascii=False),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"memory-hook {command} failed: {completed.stderr.strip()}")
+    return {"name": f"hook:{command}", "ok": True}
+
+
+def _run_user_prompt_submit(
+    hook_path: Path,
+    workspace: Path,
+    *,
+    session_id: str,
+    turn_id: str,
+    prompt: str,
+    env: dict[str, str],
+    expected_substrings: list[str],
+    name: str,
+) -> dict[str, object]:
+    completed = subprocess.run(
+        [str(hook_path), "user-prompt-submit"],
+        input=json.dumps(
+            {
+                **_base_hook_payload(session_id, workspace, turn_id),
+                "user_message_delta": prompt,
+            },
+            ensure_ascii=False,
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"memory-hook user-prompt-submit failed: {completed.stderr.strip()}")
+    try:
+        payload = json.loads(completed.stdout)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+    except Exception as exc:
+        raise AssertionError(f"user-prompt-submit returned invalid payload: {completed.stdout}") from exc
+    for expected in expected_substrings:
+        if expected not in context:
+            raise AssertionError(f"user-prompt-submit context missing {expected!r}: {context}")
+    return {"name": name, "ok": True}
+
+
+def _run_worker(
+    memoryd_path: Path,
+    workspace: Path,
+    memory_home: Path,
+    *,
+    target_session_id: str,
+    max_iterations: int = 8,
+) -> dict[str, object]:
+    seen_payloads: list[dict[str, object] | None] = []
+    for _ in range(max_iterations):
+        completed = subprocess.run(
+            [
+                str(memoryd_path),
+                "run-once",
+                "--cwd",
+                str(workspace),
+                "--memory-home",
+                str(memory_home),
+                "--backend",
+                "qwen",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(f"memoryd run-once failed: {completed.stdout}")
+        payload = json.loads(completed.stdout)
+        seen_payloads.append(payload)
+        if payload is None:
+            break
+        if payload.get("error"):
+            raise AssertionError(f"memoryd worker returned error payload: {payload['error']}")
+        job = payload.get("job") or {}
+        if job.get("session_id") == target_session_id:
+            return {"name": "memoryd_qwen", "ok": True, "payload": payload}
+    raise AssertionError(
+        f"memoryd did not process validation session {target_session_id!r}; seen payloads: "
+        f"{json.dumps(seen_payloads, ensure_ascii=False)}"
+    )
+
+
+def _check_context(
+    admin_path: Path,
+    workspace: Path,
+    memory_home: Path,
+    *,
+    expected_substring: str,
+) -> dict[str, object]:
+    completed = subprocess.run(
+        [str(admin_path), "--cwd", str(workspace), "--memory-home", str(memory_home), "context"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
     if completed.returncode != 0:
-        raise AssertionError(f"codex exec failed: {completed.stdout}")
-    output = completed.stdout
-    for hook_marker in expected_hooks:
-        if hook_marker not in output:
-            raise AssertionError(f"missing hook marker {hook_marker!r} in codex output")
-    last_message = last_message_path.read_text(encoding="utf-8").strip()
-    if _normalize_last_message(last_message) != _normalize_last_message(expected_last_message):
-        raise AssertionError(f"unexpected last message: {last_message!r} != {expected_last_message!r}")
-    return {"name": f"codex_exec:{expected_last_message}", "ok": True}
+        raise AssertionError(f"memory-admin context failed: {completed.stderr.strip()}")
+    context = completed.stdout
+    if expected_substring not in context:
+        raise AssertionError(f"context output missing {expected_substring!r}: {context}")
+    return {"name": "memory_admin_context", "ok": True}
 
 
-def _normalize_last_message(value: str) -> str:
-    return value.strip().rstrip(".。!！").casefold()
+def _base_hook_payload(session_id: str, workspace: Path, turn_id: str) -> dict[str, object]:
+    return {"session_id": session_id, "turn_id": turn_id, "cwd": str(workspace)}
 
 
-def _run_worker(memoryd_path: Path, workspace: Path, memory_home: Path) -> dict[str, object]:
-    completed = subprocess.run(
-        [
-            str(memoryd_path),
-            "run-once",
-            "--cwd",
-            str(workspace),
-            "--memory-home",
-            str(memory_home),
-            "--backend",
-            "codex",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(f"memoryd run-once failed: {completed.stdout}")
-    payload = json.loads(completed.stdout)
-    if payload is None:
-        return {
-            "name": "memoryd_codex",
-            "ok": True,
-            "payload": None,
-            "note": "no pending job (queue may already be drained by daemon)",
-        }
-    if payload.get("error"):
-        raise AssertionError(f"memoryd worker returned error payload: {payload['error']}")
-    return {"name": "memoryd_codex", "ok": True, "payload": payload}
+def _hook_env(memory_home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["CODEX_MEMORY_HOME"] = str(memory_home)
+    return env
 
 
 if __name__ == "__main__":

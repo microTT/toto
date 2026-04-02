@@ -91,10 +91,10 @@ memory/bin/memoryd run-once --cwd /path/to/workspace --memory-home ~/.codex/memo
 8. Run the worker as a daemon:
 
 ```bash
-memory/bin/memoryd daemon --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend codex --poll-interval 5
+memory/bin/memoryd daemon --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend qwen --poll-interval 5
 ```
 
-9. Optional Qwen embedding configuration in `memory/.env`:
+9. Optional Qwen summarizer + embedding configuration in `memory/.env`:
 
 ```bash
 cp -n memory/.env.example memory/.env
@@ -103,6 +103,15 @@ cp -n memory/.env.example memory/.env
 Then edit `memory/.env`:
 
 ```dotenv
+CODEX_MEMORY_SUMMARIZER_PROVIDER=auto
+CODEX_MEMORY_SUMMARIZER_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+CODEX_MEMORY_SUMMARIZER_API_KEY=
+CODEX_MEMORY_SUMMARIZER_MODEL=qwen3-max
+CODEX_MEMORY_SUMMARIZER_ENDPOINT_MODE=openai
+CODEX_MEMORY_SUMMARIZER_TIMEOUT_SECONDS=120
+CODEX_MEMORY_SUMMARIZER_TEMPERATURE=0
+CODEX_MEMORY_SUMMARIZER_MAX_OUTPUT_TOKENS=4096
+
 CODEX_MEMORY_EMBEDDING_PROVIDER=auto
 CODEX_MEMORY_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 CODEX_MEMORY_EMBEDDING_API_KEY=
@@ -111,7 +120,18 @@ CODEX_MEMORY_EMBEDDING_ENDPOINT_MODE=openai
 CODEX_MEMORY_EMBEDDING_DIMENSIONS=1024
 ```
 
-The only field you normally need to fill is `CODEX_MEMORY_EMBEDDING_API_KEY`. This default now uses the Beijing-region Alibaba Cloud Model Studio OpenAI-compatible embeddings endpoint for `text-embedding-v4`, with `CODEX_MEMORY_EMBEDDING_DIMENSIONS=1024`. With `CODEX_MEMORY_EMBEDDING_PROVIDER=auto`, the system will only use the remote endpoint after `CODEX_MEMORY_EMBEDDING_API_KEY` is present; otherwise it falls back to lexical retrieval so the local stack keeps working. If your key belongs to the international region instead, replace `CODEX_MEMORY_EMBEDDING_BASE_URL` with `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. Process environment variables still override `.env`, so CI or local shells can pin different values without editing the file. `qwen_hf` is also supported when local `torch` + `transformers` are available. If neither a remote endpoint nor a local model is available, the code falls back to a lexical hash embedding so retrieval remains functional.
+`CODEX_MEMORY_SUMMARIZER_*` and `CODEX_MEMORY_EMBEDDING_*` are intentionally separate, so you can switch the summarizer model and the embedding model independently. The defaults point to the Beijing-region Alibaba Cloud Model Studio OpenAI-compatible endpoint. In the common case, you only need to fill:
+
+- `CODEX_MEMORY_SUMMARIZER_API_KEY`
+- `CODEX_MEMORY_EMBEDDING_API_KEY`
+
+By default, the worker uses `qwen3-max` for summarization and `text-embedding-v4` for archive retrieval. If `CODEX_MEMORY_SUMMARIZER_API_KEY` or `CODEX_MEMORY_SUMMARIZER_BASE_URL` are left empty, the summarizer will reuse the embedding-side API key / base URL as a migration-friendly fallback; setting the summarizer variables explicitly always takes precedence. If your key belongs to the international region instead, replace `CODEX_MEMORY_SUMMARIZER_BASE_URL` and `CODEX_MEMORY_EMBEDDING_BASE_URL` with `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. Process environment variables still override `.env`, so CI or local shells can pin different values without editing the file.
+
+Embedding-specific behavior:
+
+- With `CODEX_MEMORY_EMBEDDING_PROVIDER=auto`, the system only uses the remote endpoint after `CODEX_MEMORY_EMBEDDING_API_KEY` is present; otherwise it falls back to lexical retrieval so the local stack keeps working.
+- `qwen_hf` is also supported when local `torch` + `transformers` are available.
+- If neither a remote endpoint nor a local model is available, the code falls back to a lexical hash embedding so retrieval remains functional.
 
 10. Validate the installed stack end-to-end:
 

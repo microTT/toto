@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     get_parser.add_argument("record_id")
 
     worker_parser = subparsers.add_parser("worker-run-once")
-    worker_parser.add_argument("--backend", default="codex", choices=["codex", "heuristic"])
+    worker_parser.add_argument("--backend", default="qwen", choices=["qwen", "heuristic"])
 
     upsert_parser = subparsers.add_parser("upsert")
     upsert_parser.add_argument("--scope", required=True, choices=["global", "local"])

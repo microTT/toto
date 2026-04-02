@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import argparse
+import json
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from memory_system.archive import archive_stale_recent_documents
+from memory_system.config import resolve_config
+from memory_system.worker import run_worker_once
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="memoryd")
+    parser.add_argument("command", choices=["run-once", "archive", "daemon"])
+    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--memory-home", default=None)
+    parser.add_argument("--backend", default="codex", choices=["codex", "heuristic"])
+    parser.add_argument("--poll-interval", type=float, default=5.0)
+    args = parser.parse_args()
+    if args.command == "archive":
+        config = resolve_config(args.cwd, args.memory_home)
+        print(json.dumps({"archived": [str(path) for path in archive_stale_recent_documents(config)]}, indent=2))
+        return 0
+    if args.command == "daemon":
+        try:
+            while True:
+                result = run_worker_once(args.cwd, memory_home=args.memory_home, backend=args.backend)
+                if result is not None:
+                    print(json.dumps(result, indent=2))
+                    sys.stdout.flush()
+                time.sleep(max(0.1, args.poll_interval))
+        except KeyboardInterrupt:
+            return 0
+    result = run_worker_once(args.cwd, memory_home=args.memory_home, backend=args.backend)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

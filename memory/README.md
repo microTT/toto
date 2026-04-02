@@ -1,0 +1,158 @@
+# Local Memory System
+
+This directory contains a self-contained local memory system for Codex-style workflows.
+
+By default, the system stores control state in `~/.codex/memories/<workspace_instance_id>`. If that location is not writable, it falls back to `<workspace>/.memory-system`. For real `workspace-write` Codex sessions, explicitly pinning `CODEX_MEMORY_HOME` to the same path keeps hooks, worker, and MCP on one store.
+
+Within `memory_home`, the layout is:
+
+- `control/` for SQLite state and job queue
+- `global/` for durable memory files
+- `workspace/recent`, `workspace/archive`, `workspace/runtime`, and `workspace/audit`
+
+## Components
+
+- `memory/bin/memory-hook`
+  Hook entrypoint for `session-start`, `user-prompt-submit`, and `stop`.
+- `memory/bin/memoryd`
+  Worker entrypoint for one-shot processing, daemon polling, retry/backoff, and stale-recent archiving.
+- `memory/bin/memory-admin`
+  Manual operations for bootstrap, context, upsert, delete, pin, archive, search, and index rebuild.
+- `memory/bin/memory-mcp`
+  Minimal stdio MCP server exposing memory read tools, with optional write tools behind `--allow-writes`.
+- `memory/memory_system/`
+  Python implementation.
+- `memory/schemas/memory_patch.schema.json`
+  Patch-plan schema for the summarizer worker.
+
+## Quick Start
+
+1. Bootstrap the filesystem layout:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace bootstrap
+```
+
+2. Add a global preference:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace upsert \
+  --scope global \
+  --type preference \
+  --subject "package manager" \
+  --summary "Prefer pnpm unless repo requires npm" \
+  --tags "javascript,tooling" \
+  --scope-reason "cross-workspace and durable"
+```
+
+3. Add a local task context:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace upsert \
+  --scope local \
+  --type task_context \
+  --subject "auth flaky tests" \
+  --summary "Snapshots fail on CI" \
+  --next-use "re-check snapshots before auth middleware" \
+  --scope-reason "repo-specific and near-term"
+```
+
+4. Inspect the current auto-loaded snapshot:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace context
+```
+
+5. Print the recommended `hooks.json` payload:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace print-hooks-config
+```
+
+Before using hooks, ensure the feature is enabled:
+
+```bash
+codex features list
+codex features enable codex_hooks
+```
+
+6. Rebuild the archive search index:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace rebuild-index --json
+```
+
+7. Run one worker pass:
+
+```bash
+memory/bin/memoryd run-once --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend heuristic
+```
+
+8. Run the worker as a daemon:
+
+```bash
+memory/bin/memoryd daemon --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend codex --poll-interval 5
+```
+
+9. Optional Qwen embedding configuration in `memory/.env`:
+
+```bash
+cp -n memory/.env.example memory/.env
+```
+
+Then edit `memory/.env`:
+
+```dotenv
+CODEX_MEMORY_EMBEDDING_PROVIDER=auto
+CODEX_MEMORY_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+CODEX_MEMORY_EMBEDDING_API_KEY=
+CODEX_MEMORY_EMBEDDING_MODEL=text-embedding-v4
+CODEX_MEMORY_EMBEDDING_ENDPOINT_MODE=openai
+CODEX_MEMORY_EMBEDDING_DIMENSIONS=1024
+```
+
+The only field you normally need to fill is `CODEX_MEMORY_EMBEDDING_API_KEY`. This default now uses the Beijing-region Alibaba Cloud Model Studio OpenAI-compatible embeddings endpoint for `text-embedding-v4`, with `CODEX_MEMORY_EMBEDDING_DIMENSIONS=1024`. With `CODEX_MEMORY_EMBEDDING_PROVIDER=auto`, the system will only use the remote endpoint after `CODEX_MEMORY_EMBEDDING_API_KEY` is present; otherwise it falls back to lexical retrieval so the local stack keeps working. If your key belongs to the international region instead, replace `CODEX_MEMORY_EMBEDDING_BASE_URL` with `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. Process environment variables still override `.env`, so CI or local shells can pin different values without editing the file. `qwen_hf` is also supported when local `torch` + `transformers` are available. If neither a remote endpoint nor a local model is available, the code falls back to a lexical hash embedding so retrieval remains functional.
+
+10. Validate the installed stack end-to-end:
+
+```bash
+memory/scripts/validate_installed_stack.py \
+  --workspace /path/to/workspace \
+  --memory-home ~/.codex/memories/<workspace_instance_id>
+```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s memory/tests -t .
+```
+
+One-command smoke E2E (includes compileall, unit tests, schema smoke, isolated command E2E, and installed live validation):
+
+```bash
+memory/scripts/smoke_e2e.sh \
+  --workspace /path/to/workspace \
+  --memory-home ~/.codex/memories/<workspace_instance_id>
+```
+
+If you only want repository-local checks (skip installed live validation):
+
+```bash
+memory/scripts/smoke_e2e.sh --skip-live
+```
+
+## LaunchAgent
+
+Install (auto-start on login/reboot):
+
+```bash
+memory/scripts/install_launchd.sh \
+  --workspace /path/to/workspace \
+  --memory-home ~/.codex/memories/<workspace_instance_id>
+```
+
+Uninstall:
+
+```bash
+memory/scripts/uninstall_launchd.sh
+```

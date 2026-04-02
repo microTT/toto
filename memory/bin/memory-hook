@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from memory_system.hooks import run_hook
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: memory-hook <session-start|user-prompt-submit|stop>")
+    output = run_hook(sys.argv[1])
+    if output:
+        sys.stdout.write(output)
+        if not output.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

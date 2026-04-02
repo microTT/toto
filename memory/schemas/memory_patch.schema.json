@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "reason",
+    "base_revisions",
+    "global_ops",
+    "local_ops",
+    "needs_manual_review"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["noop", "write"]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "base_revisions": {
+      "$ref": "#/$defs/baseRevisions"
+    },
+    "global_ops": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/op"
+      }
+    },
+    "local_ops": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/op"
+      }
+    },
+    "needs_manual_review": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableRecord": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/record"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableTombstone": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/tombstone"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullablePin": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/pin"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "baseRevisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "global_revision",
+        "local_recent_revision"
+      ],
+      "properties": {
+        "global_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "local_recent_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "status",
+        "confidence",
+        "subject",
+        "summary",
+        "tags",
+        "source_refs",
+        "scope_reason",
+        "rationale",
+        "next_use",
+        "pin_until",
+        "supersedes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "type": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "confidence": {
+          "type": ["string", "null"],
+          "enum": ["high", "medium", "low", null]
+        },
+        "subject": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scope_reason": {
+          "type": "string"
+        },
+        "rationale": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "next_use": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "pin_until": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "supersedes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "source_refs"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "pin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pin_until"
+      ],
+      "properties": {
+        "pin_until": {
+          "type": "string"
+        }
+      }
+    },
+    "op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "target_id",
+        "record",
+        "record_patch",
+        "replacement_record",
+        "tombstone",
+        "pin"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["create", "update", "supersede", "delete", "pin", "promote", "demote"]
+        },
+        "target_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "record": {
+          "$ref": "#/$defs/nullableRecord"
+        },
+        "record_patch": {
+          "$ref": "#/$defs/nullableRecord"
+        },
+        "replacement_record": {
+          "$ref": "#/$defs/nullableRecord"
+        },
+        "tombstone": {
+          "$ref": "#/$defs/nullableTombstone"
+        },
+        "pin": {
+          "$ref": "#/$defs/nullablePin"
+        }
+      }
+    }
+  }
+}

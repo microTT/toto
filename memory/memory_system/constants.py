@@ -1,0 +1,42 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+GLOBAL_SCOPE = "global_long_term"
+LOCAL_RECENT_SCOPE = "local_recent"
+LOCAL_ARCHIVE_SCOPE = "local_archive"
+
+STATUS_ACTIVE = "active"
+STATUS_OPEN = "open"
+STATUS_CLOSED = "closed"
+STATUS_SUPERSEDED = "superseded"
+STATUS_DELETED = "deleted"
+
+GLOBAL_SECTION_ORDER = ["Active", "Superseded", "Deleted"]
+LOCAL_SECTION_ORDER = ["Open", "Active", "Closed", "Superseded", "Deleted"]
+
+SECTION_TO_STATUS = {
+    "Active": STATUS_ACTIVE,
+    "Open": STATUS_OPEN,
+    "Closed": STATUS_CLOSED,
+    "Superseded": STATUS_SUPERSEDED,
+    "Deleted": STATUS_DELETED,
+}
+
+STATUS_TO_SECTION = {value: key for key, value in SECTION_TO_STATUS.items()}
+
+DEFAULT_GLOBAL_LIMIT = 20
+DEFAULT_LOCAL_LIMIT = 25
+DEFAULT_TOKEN_BUDGET = 3000
+DEFAULT_SCHEMA_VERSION = 1
+DEFAULT_PROMPT_VERSION = "v1"
+DEFAULT_JOB_MAX_ATTEMPTS = 3
+DEFAULT_JOB_RETRY_BASE_SECONDS = 30
+DEFAULT_WORKER_POLL_INTERVAL_SECONDS = 5
+DEFAULT_RUNNING_JOB_TIMEOUT_SECONDS = 300
+DEFAULT_RUNTIME_SNAPSHOT_RETENTION_DAYS = 7
+DEFAULT_COMPLETED_JOB_RETENTION_DAYS = 14
+DEFAULT_FAILED_JOB_RETENTION_DAYS = 30
+
+MODULE_ROOT = Path(__file__).resolve().parent.parent
+SCHEMA_DIR = MODULE_ROOT / "schemas"

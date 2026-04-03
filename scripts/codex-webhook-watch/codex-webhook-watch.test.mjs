@@ -12,7 +12,7 @@ const scriptPath = fileURLToPath(
   new URL("./codex-webhook-watch.mjs", import.meta.url),
 );
 
-async function runWatcher(lines) {
+async function runWatcher(lines, extraArgs = []) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "codex-watch-"));
 
   try {
@@ -28,6 +28,7 @@ async function runWatcher(lines) {
       "0",
       "--root",
       rootDir,
+      ...extraArgs,
     ]);
 
     return stdout;
@@ -66,23 +67,41 @@ function buildBaseRecords(functionName, callId) {
   ];
 }
 
-test("notifies for pending chrome_devtools MCP approvals", async () => {
+function buildTaskCompleteRecords() {
+  return [
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "sess-1" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "final answer",
+      },
+    }),
+  ];
+}
+
+test("does not notify for pending chrome_devtools MCP approvals by default", async () => {
   const stdout = await runWatcher(
     buildBaseRecords("mcp__chrome_devtools__evaluate_script", "call-1"),
   );
 
-  assert.match(stdout, /approval_needed/);
-  assert.match(stdout, /chrome_devtools/);
-  assert.match(stdout, /evaluate_script/);
+  assert.doesNotMatch(stdout, /approval_needed/);
 });
 
-test("notifies for pending chrome-devtools MCP approvals", async () => {
+test("can opt in to pending chrome_devtools MCP approvals", async () => {
   const stdout = await runWatcher(
-    buildBaseRecords("mcp__chrome-devtools__evaluate_script", "call-2"),
+    buildBaseRecords("mcp__chrome_devtools__evaluate_script", "call-2"),
+    ["--approval-mcp-servers", "chrome_devtools"],
   );
 
   assert.match(stdout, /approval_needed/);
-  assert.match(stdout, /chrome-devtools/);
+  assert.match(stdout, /chrome_devtools/);
   assert.match(stdout, /evaluate_script/);
 });
 
@@ -101,4 +120,183 @@ test("does not notify when MCP call already completed", async () => {
   ]);
 
   assert.doesNotMatch(stdout, /approval_needed/);
+});
+
+test("notifies for pending sandbox approvals", async () => {
+  const stdout = await runWatcher([
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "sess-1" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        cwd: "/tmp/project",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.200Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        arguments: JSON.stringify({
+          cmd: "npm install",
+          sandbox_permissions: "require_escalated",
+          justification: "Need network access",
+        }),
+        call_id: "call-4",
+      },
+    }),
+  ]);
+
+  assert.match(stdout, /approval_needed/);
+  assert.match(stdout, /npm install/);
+});
+
+test("does not notify sandbox approvals already covered by approved prefix rules", async () => {
+  const stdout = await runWatcher([
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "sess-1" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.050Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "<permissions instructions>\n" +
+              "The following prefix rules have already been approved:\n" +
+              '- ["npm", "install"]\n' +
+              "The writable roots are /tmp\n" +
+              "</permissions instructions>",
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        cwd: "/tmp/project",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.200Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        arguments: JSON.stringify({
+          cmd: "npm install",
+          sandbox_permissions: "require_escalated",
+          prefix_rule: ["npm", "install"],
+          justification: "Need network access",
+        }),
+        call_id: "call-5",
+      },
+    }),
+  ]);
+
+  assert.doesNotMatch(stdout, /approval_needed/);
+});
+
+test("does not notify sandbox approvals that enter guardian assessment", async () => {
+  const stdout = await runWatcher([
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "sess-1" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        cwd: "/tmp/project",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.200Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        arguments: JSON.stringify({
+          cmd: "npm install",
+          sandbox_permissions: "require_escalated",
+          justification: "Need network access",
+        }),
+        call_id: "call-6",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.250Z",
+      type: "event_msg",
+      payload: {
+        type: "guardian_assessment",
+        id: "call-6",
+        status: "in_progress",
+        turn_id: "turn-1",
+      },
+    }),
+  ]);
+
+  assert.doesNotMatch(stdout, /approval_needed/);
+});
+
+test("notifies for task completion after quiet period", async () => {
+  const stdout = await runWatcher(buildTaskCompleteRecords(), [
+    "--task-complete-wait",
+    "0",
+  ]);
+
+  assert.match(stdout, /task_complete/);
+  assert.match(stdout, /Codex 任务完成/);
+  assert.match(stdout, /final answer/);
+});
+
+test("suppresses task completion when a new user message arrives", async () => {
+  const stdout = await runWatcher([
+    ...buildTaskCompleteRecords(),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.200Z",
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: "follow up",
+        images: [],
+        local_images: [],
+        text_elements: [],
+      },
+    }),
+  ]);
+
+  assert.doesNotMatch(stdout, /task_complete/);
+});
+
+test("suppresses task completion when the next task already started", async () => {
+  const stdout = await runWatcher([
+    ...buildTaskCompleteRecords(),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.200Z",
+      type: "event_msg",
+      payload: {
+        type: "task_started",
+        turn_id: "turn-2",
+      },
+    }),
+  ]);
+
+  assert.doesNotMatch(stdout, /task_complete/);
 });

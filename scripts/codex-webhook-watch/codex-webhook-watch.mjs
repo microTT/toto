@@ -11,13 +11,15 @@ Options:
   --url <url>           Webhook URL. Can also use CODEX_WEBHOOK_URL.
   --root <dir>          Session root. Defaults to ~/.codex/sessions.
   --events <list>       Comma-separated: task_complete,approval_needed
+  --task-complete-wait <ms>
+                        Wait before sending task_complete so short follow-up turns
+                        can suppress intermediate notifications. Default: 15000.
   --at-mobiles <list>   Comma-separated mobile numbers for DingTalk @.
   --at-user-ids <list>  Comma-separated DingTalk user IDs for @.
   --at-all              Mention everyone in DingTalk.
   --approval-mcp-servers <list>
                         Comma-separated MCP server names whose pending tool calls
-                        should be treated as approval waits. Default:
-                        chrome-devtools,chrome_devtools.
+                        should be treated as approval waits. Default: empty.
   --approval-wait <ms>  Wait before flagging a pending manual approval. Default: 2500.
   --interval <ms>       Poll interval in milliseconds. Default: 1500.
   --replay              Read existing session content from the beginning.
@@ -31,18 +33,18 @@ function parseArgs(argv) {
   const options = {
     url: process.env.CODEX_WEBHOOK_URL || "",
     root: path.join(homedir(), ".codex", "sessions"),
-    events: new Set(["task_complete", "approval_needed"]),
+    events: new Set(
+      splitList(process.env.CODEX_WATCH_EVENTS || "task_complete,approval_needed"),
+    ),
+    taskCompleteWaitMs: Number(process.env.CODEX_TASK_COMPLETE_WAIT_MS || 15000),
     atMobiles: splitList(process.env.CODEX_DINGTALK_AT_MOBILES || ""),
     atUserIds: splitList(process.env.CODEX_DINGTALK_AT_USER_IDS || ""),
     atAll: process.env.CODEX_DINGTALK_AT_ALL === "true",
     approvalMcpServers: new Set(
-      splitList(
-        process.env.CODEX_APPROVAL_MCP_SERVERS ||
-          "chrome-devtools,chrome_devtools",
-      ),
+      splitList(process.env.CODEX_APPROVAL_MCP_SERVERS || ""),
     ),
-    approvalWaitMs: 2500,
-    intervalMs: 1500,
+    approvalWaitMs: Number(process.env.CODEX_APPROVAL_WAIT_MS || 2500),
+    intervalMs: Number(process.env.CODEX_WATCH_INTERVAL_MS || 1500),
     replay: false,
     dryRun: false,
     once: false,
@@ -65,6 +67,12 @@ function parseArgs(argv) {
         .map(item => item.trim())
         .filter(Boolean);
       options.events = new Set(nextEvents);
+      continue;
+    }
+    if (arg === "--task-complete-wait") {
+      options.taskCompleteWaitMs = Number(
+        argv[++i] || options.taskCompleteWaitMs,
+      );
       continue;
     }
     if (arg === "--at-mobiles") {
@@ -176,14 +184,14 @@ function parseSessionIdFromPath(filePath) {
   return base.slice(marker + 1);
 }
 
-function buildTaskCompleteEvent(record, state, filePath) {
+function buildTaskCompleteEvent(pending, state) {
   return {
     event: "task_complete",
-    timestamp: record.timestamp,
+    timestamp: pending.timestamp,
     session_id: state.sessionId,
-    turn_id: record.payload.turn_id || state.currentTurnId || null,
-    last_agent_message: record.payload.last_agent_message || "",
-    file: filePath,
+    turn_id: pending.turn_id || state.currentTurnId || null,
+    last_agent_message: pending.last_agent_message || "",
+    file: pending.file,
   };
 }
 
@@ -352,6 +360,18 @@ function rememberApprovalCall(record, state, filePath, options) {
   return null;
 }
 
+function rememberTaskComplete(record, state, filePath) {
+  state.pendingTaskComplete = {
+    timestamp: record.timestamp,
+    createdAtMs: Date.parse(record.timestamp),
+    turn_id: record.payload?.turn_id || state.currentTurnId || null,
+    last_agent_message: record.payload?.last_agent_message || "",
+    file: filePath,
+    notified: false,
+  };
+  return null;
+}
+
 function buildApprovalEvent(pending, state) {
   return {
     event: "approval_needed",
@@ -393,6 +413,28 @@ function cleanupApprovalState(record, state) {
     if (record.payload?.status && record.payload.status !== "in_progress") {
       state.pendingApprovals.delete(record.payload.id);
     }
+  }
+}
+
+function cleanupTaskCompleteState(record, state) {
+  if (
+    record?.type === "response_item" &&
+    record.payload?.type === "message" &&
+    record.payload?.role === "user"
+  ) {
+    state.pendingTaskComplete = null;
+    return;
+  }
+
+  if (record?.type !== "event_msg") {
+    return;
+  }
+
+  if (
+    record.payload?.type === "user_message" ||
+    record.payload?.type === "task_started"
+  ) {
+    state.pendingTaskComplete = null;
   }
 }
 
@@ -563,6 +605,27 @@ async function maybeEmitPendingApprovals(state, options) {
   }
 }
 
+async function maybeEmitPendingTaskComplete(state, options) {
+  if (!options.events.has("task_complete")) {
+    return;
+  }
+
+  const pending = state.pendingTaskComplete;
+  if (!pending || pending.notified) {
+    return;
+  }
+  if (!Number.isFinite(pending.createdAtMs)) {
+    return;
+  }
+  if (Date.now() - pending.createdAtMs < options.taskCompleteWaitMs) {
+    return;
+  }
+
+  pending.notified = true;
+  await emitPayload(buildTaskCompleteEvent(pending, state), state, options);
+  state.pendingTaskComplete = null;
+}
+
 async function handleRecord(record, state, options, filePath) {
   const approvedPrefixRules = extractApprovedPrefixRules(record);
   if (approvedPrefixRules) {
@@ -570,6 +633,7 @@ async function handleRecord(record, state, options, filePath) {
   }
 
   cleanupApprovalState(record, state);
+  cleanupTaskCompleteState(record, state);
 
   if (record?.type === "session_meta" && record.payload?.id) {
     state.sessionId = record.payload.id;
@@ -588,7 +652,7 @@ async function handleRecord(record, state, options, filePath) {
 
   if (record?.type === "event_msg" && record.payload?.type === "task_complete") {
     if (options.events.has("task_complete")) {
-      payload = buildTaskCompleteEvent(record, state, filePath);
+      payload = rememberTaskComplete(record, state, filePath);
     }
   } else if (record?.type === "response_item" && record.payload?.type === "function_call") {
     if (options.events.has("approval_needed")) {
@@ -634,6 +698,7 @@ async function processFile(filePath, state, options) {
 
   if (stats.size === state.offset) {
     await maybeEmitPendingApprovals(state, options);
+    await maybeEmitPendingTaskComplete(state, options);
     return;
   }
 
@@ -656,6 +721,7 @@ async function processFile(filePath, state, options) {
   }
 
   await maybeEmitPendingApprovals(state, options);
+  await maybeEmitPendingTaskComplete(state, options);
 }
 
 async function main() {
@@ -678,6 +744,7 @@ async function main() {
           currentCwd: null,
           approvedPrefixRules: [],
           pendingApprovals: new Map(),
+          pendingTaskComplete: null,
           offset: 0,
           remainder: "",
           initialized: false,

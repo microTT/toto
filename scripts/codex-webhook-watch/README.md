@@ -17,7 +17,9 @@
 ## 当前支持的事件
 
 - `task_complete`
-  - Codex 一个 turn 完成时发送通知
+  - Codex 完成一个回合后，不会立刻发送
+  - 只有在短暂空闲窗口后，且期间没有新的 `user_message` / `task_started`，才发送通知
+  - 目的：压掉同一 session 内很快继续追问、澄清、补充导致的“中间态完成”通知
 - `approval_needed`
   - 只对“看起来真的在等人审批”的提权请求发送通知
   - 具体规则是：
@@ -26,8 +28,9 @@
       - 已进入 `guardian_assessment` 路径的自动审批不通知
       - 没有进入 `guardian_assessment`、并且短时间内仍未执行完成的 `require_escalated` 请求会通知
     - MCP 工具审批：
-      - 默认监控 `chrome-devtools` / `chrome_devtools`
-      - 当对应 `function_call` 发出后，短时间内仍没有 `function_call_output`，会按“疑似等待人工审批”通知
+      - 默认不监控任何 MCP server
+      - 只有你显式通过 `--approval-mcp-servers` 配置后，才会把对应 MCP `function_call` 的长时间无返回视为“疑似等待人工审批”
+      - 这类信号本质上是启发式判断，不再默认开启
 
 ## 钉钉消息格式
 
@@ -78,11 +81,14 @@ node /Users/microTT/toto/scripts/codex-webhook-watch/codex-webhook-watch.mjs \
   - 逗号分隔，默认 `task_complete,approval_needed`
 - `--interval`
   - 轮询间隔，默认 `1500`
+- `--task-complete-wait`
+  - 发送 `task_complete` 前的静默等待时间，默认 `15000`
+  - 在这段时间内若出现新的 `user_message` 或 `task_started`，本次完成通知会被抑制
 - `--approval-wait`
   - 判定为“人工审批等待中”前的等待时间，默认 `2500`
 - `--approval-mcp-servers`
   - 逗号分隔的 MCP server 名称列表
-  - 默认 `chrome-devtools,chrome_devtools`
+  - 默认空
   - 这些 server 的 `function_call` 如果长时间没有 `function_call_output`，会被当作审批等待
 - `--replay`
   - 从现有 session 文件头开始扫描
@@ -107,6 +113,8 @@ node /Users/microTT/toto/scripts/codex-webhook-watch/codex-webhook-watch.mjs \
 - `CODEX_DINGTALK_AT_ALL`
 - `CODEX_WATCH_EVENTS`
 - `CODEX_WATCH_INTERVAL_MS`
+- `CODEX_TASK_COMPLETE_WAIT_MS`
+- `CODEX_APPROVAL_WAIT_MS`
 - `CODEX_APPROVAL_MCP_SERVERS`
 
 ## launchd 常驻

@@ -11,6 +11,7 @@ from .env_config import config_value, first_non_empty, load_dotenv_file, resolve
 from .errors import PatchApplyError, SummarizerExecutionError
 from .markdown_store import load_document
 from .state_db import SummaryJob
+from .validation import validate_patch_plan
 
 DEFAULT_SUMMARIZER_MODEL = "qwen3-max"
 DEFAULT_SUMMARIZER_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -20,6 +21,32 @@ DEFAULT_SUMMARIZER_TIMEOUT_SECONDS = 120
 DEFAULT_SUMMARIZER_MAX_OUTPUT_TOKENS = 4096
 QWEN_BACKENDS = {"qwen"}
 LEGACY_BACKEND_ALIASES = {"codex": "qwen"}
+CREATE_RECORD_FIELDS = {
+    "id",
+    "type",
+    "status",
+    "confidence",
+    "subject",
+    "summary",
+    "rationale",
+    "next_use",
+    "tags",
+    "source_refs",
+    "scope_reason",
+    "pin_until",
+    "supersedes",
+    "superseded_by",
+    "created_at",
+    "updated_at",
+}
+STATUS_ALIASES = {
+    "resolved": "closed",
+    "complete": "closed",
+    "completed": "closed",
+    "done": "closed",
+    "todo": "open",
+    "pending": "open",
+}
 SUMMARIZER_SYSTEM_PROMPT = (
     "你是本地记忆系统的总结器。"
     "你的任务是根据当前对话增量和已有记忆，输出一个 JSON patch plan。"
@@ -153,6 +180,7 @@ def build_patch_prompt(
         "输出要求：\n"
         "返回 patch plan，包含 decision、reason、base_revisions、global_ops、local_ops、needs_manual_review。\n"
         "允许动作：create、update、supersede、delete、pin、promote、demote。\n"
+        "- create 动作必须包含 record 对象；不要只返回 content 或 summary 字符串。\n"
     )
 
 
@@ -263,20 +291,31 @@ def _run_qwen_completion(*, config: MemoryConfig, job: SummaryJob, events: list[
         raise
     except Exception as exc:
         raise SummarizerExecutionError(f"qwen summarizer response parse failed: {exc}") from exc
-    return _normalize_model_patch_plan(patch_plan)
+    normalized = _normalize_model_patch_plan(patch_plan)
+    try:
+        validate_patch_plan(normalized)
+    except PatchApplyError as exc:
+        raise SummarizerExecutionError(f"qwen summarizer returned invalid patch plan: {exc}") from exc
+    return normalized
 
 
 def _normalize_model_patch_plan(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
-    normalized["global_ops"] = [_normalize_model_op(op) for op in payload.get("global_ops", [])]
-    normalized["local_ops"] = [_normalize_model_op(op) for op in payload.get("local_ops", [])]
+    normalized["global_ops"] = [_normalize_model_op(op, scope="global") for op in payload.get("global_ops", [])]
+    normalized["local_ops"] = [_normalize_model_op(op, scope="local") for op in payload.get("local_ops", [])]
     normalized["decision"] = _normalize_decision(normalized.get("decision"), payload=normalized)
     return normalized
 
 
-def _normalize_model_op(op: dict[str, Any]) -> dict[str, Any]:
+def _normalize_model_op(op: dict[str, Any], *, scope: str) -> dict[str, Any]:
     cleaned = {key: value for key, value in op.items() if value is not None}
     action = cleaned.get("action")
+    record_scope = scope
+    replacement_scope = scope
+    if action == "promote":
+        replacement_scope = "global"
+    elif action == "demote":
+        replacement_scope = "local"
     if isinstance(cleaned.get("id"), str) and "target_id" not in cleaned:
         cleaned["target_id"] = cleaned.pop("id")
     if isinstance(cleaned.get("fields"), dict):
@@ -284,12 +323,34 @@ def _normalize_model_op(op: dict[str, Any]) -> dict[str, Any]:
             cleaned["record"] = cleaned.pop("fields")
         elif action == "update" and "record_patch" not in cleaned:
             cleaned["record_patch"] = cleaned.pop("fields")
+    if action == "update" and "record_patch" not in cleaned and isinstance(cleaned.get("record"), dict):
+        cleaned["record_patch"] = cleaned.pop("record")
     if isinstance(cleaned.get("replacement"), dict) and "replacement_record" not in cleaned:
         cleaned["replacement_record"] = cleaned.pop("replacement")
+    if action in {"supersede", "promote", "demote"} and isinstance(cleaned.get("record"), dict):
+        cleaned.setdefault("replacement_record", cleaned.pop("record"))
     if action == "delete" and "tombstone" not in cleaned and isinstance(cleaned.get("reason"), str):
         cleaned["tombstone"] = {"reason": cleaned.pop("reason"), "source_refs": []}
     if action == "pin" and "pin" not in cleaned and isinstance(cleaned.get("pin_until"), str):
         cleaned["pin"] = {"pin_until": cleaned.pop("pin_until")}
+    if action == "create" and "record" not in cleaned:
+        record = _normalize_create_record(cleaned, scope=record_scope)
+        if record is not None:
+            cleaned["record"] = record
+    if isinstance(cleaned.get("record"), dict):
+        cleaned["record"] = _normalize_record_payload(
+            cleaned["record"],
+            scope=record_scope,
+            require_status=action == "create",
+        )
+    if isinstance(cleaned.get("record_patch"), dict):
+        cleaned["record_patch"] = _normalize_record_patch_payload(cleaned["record_patch"])
+    if isinstance(cleaned.get("replacement_record"), dict):
+        cleaned["replacement_record"] = _normalize_record_payload(
+            cleaned["replacement_record"],
+            scope=replacement_scope,
+            require_status=False,
+        )
     for field in ("record", "record_patch", "replacement_record", "tombstone", "pin"):
         value = cleaned.get(field)
         if isinstance(value, dict):
@@ -299,6 +360,80 @@ def _normalize_model_op(op: dict[str, Any]) -> dict[str, Any]:
                 if nested_value is not None
             }
     return cleaned
+
+
+def _normalize_create_record(op: dict[str, Any], *, scope: str) -> dict[str, Any] | None:
+    record = {field: op[field] for field in CREATE_RECORD_FIELDS if field in op}
+    content = _extract_create_summary(op)
+    if content is not None and "summary" not in record:
+        record["summary"] = content
+    if not record:
+        return None
+    return _normalize_record_payload(record, scope=scope, require_status=True)
+
+
+def _normalize_record_payload(
+    record: dict[str, Any],
+    *,
+    scope: str,
+    require_status: bool,
+) -> dict[str, Any]:
+    normalized = dict(record)
+    content = _extract_create_summary(normalized)
+    if content is not None and "summary" not in normalized:
+        normalized["summary"] = content
+    if "type" not in normalized:
+        normalized["type"] = "task_context" if scope == "local" else "fact"
+    if isinstance(normalized.get("status"), str):
+        normalized["status"] = _normalize_status(normalized["status"])
+    if require_status and "status" not in normalized:
+        normalized["status"] = "open" if scope == "local" else "active"
+    if "confidence" not in normalized:
+        normalized["confidence"] = "medium"
+    if "subject" not in normalized:
+        normalized["subject"] = _summarize_subject(normalized.get("summary"), scope=scope)
+    if "tags" not in normalized or not isinstance(normalized["tags"], list):
+        normalized["tags"] = []
+    if "source_refs" not in normalized or not isinstance(normalized["source_refs"], list):
+        normalized["source_refs"] = []
+    if "scope_reason" not in normalized:
+        normalized["scope_reason"] = (
+            "repo-specific and near-term" if scope == "local" else "cross-workspace and durable"
+        )
+    return normalized
+
+
+def _normalize_record_patch_payload(record_patch: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record_patch)
+    content = _extract_create_summary(normalized)
+    if content is not None and "summary" not in normalized:
+        normalized["summary"] = content
+    if isinstance(normalized.get("status"), str):
+        normalized["status"] = _normalize_status(normalized["status"])
+    return normalized
+
+
+def _extract_create_summary(op: dict[str, Any]) -> str | None:
+    for key in ("summary", "content", "text", "message", "note"):
+        value = op.get(key)
+        if isinstance(value, str):
+            compact = " ".join(value.split())
+            if compact:
+                return compact
+    return None
+
+
+def _summarize_subject(summary: Any, *, scope: str) -> str:
+    if isinstance(summary, str):
+        compact = " ".join(summary.split())
+        if compact:
+            return compact if len(compact) <= 60 else f"{compact[:57]}..."
+    return "本地记忆" if scope == "local" else "全局记忆"
+
+
+def _normalize_status(status: str) -> str:
+    compact = status.strip().lower()
+    return STATUS_ALIASES.get(compact, compact)
 
 
 def _normalize_decision(decision: Any, *, payload: dict[str, Any]) -> str:

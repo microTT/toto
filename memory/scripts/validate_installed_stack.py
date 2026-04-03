@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -231,17 +232,78 @@ def _run_worker(
             raise AssertionError(f"memoryd run-once failed: {completed.stdout}")
         payload = json.loads(completed.stdout)
         seen_payloads.append(payload)
+        existing = _lookup_summary_job(memory_home, target_session_id)
+        if existing is not None:
+            if existing["status"] == "completed":
+                return {"name": "memoryd_qwen", "ok": True, "payload": existing["payload"], "source": "state_db"}
+            if existing["status"] == "failed":
+                raise AssertionError(
+                    f"memoryd worker recorded failed job for validation session {target_session_id!r}: "
+                    f"{existing['last_error']}"
+                )
         if payload is None:
             break
-        if payload.get("error"):
-            raise AssertionError(f"memoryd worker returned error payload: {payload['error']}")
         job = payload.get("job") or {}
+        if payload.get("error"):
+            if job.get("session_id") == target_session_id:
+                raise AssertionError(f"memoryd worker returned error payload: {payload['error']}")
+            continue
         if job.get("session_id") == target_session_id:
             return {"name": "memoryd_qwen", "ok": True, "payload": payload}
+    existing = _lookup_summary_job(memory_home, target_session_id)
+    if existing is not None and existing["status"] == "completed":
+        return {"name": "memoryd_qwen", "ok": True, "payload": existing["payload"], "source": "state_db"}
+    existing = _wait_for_summary_job(memory_home, target_session_id, timeout_seconds=5.0)
+    if existing is not None:
+        if existing["status"] == "completed":
+            return {"name": "memoryd_qwen", "ok": True, "payload": existing["payload"], "source": "state_db"}
+        if existing["status"] == "failed":
+            raise AssertionError(
+                f"memoryd worker recorded failed job for validation session {target_session_id!r}: "
+                f"{existing['last_error']}"
+            )
     raise AssertionError(
         f"memoryd did not process validation session {target_session_id!r}; seen payloads: "
         f"{json.dumps(seen_payloads, ensure_ascii=False)}"
     )
+
+
+def _lookup_summary_job(memory_home: Path, session_id: str) -> dict[str, object] | None:
+    state_db = memory_home / "control" / "state.sqlite"
+    connection = sqlite3.connect(state_db)
+    try:
+        row = connection.execute(
+            """
+            SELECT status, last_error, payload_json
+            FROM summary_jobs
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    payload = json.loads(row[2]) if row[2] else None
+    return {"status": row[0], "last_error": row[1], "payload": payload}
+
+
+def _wait_for_summary_job(
+    memory_home: Path,
+    session_id: str,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.25,
+) -> dict[str, object] | None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        existing = _lookup_summary_job(memory_home, session_id)
+        if existing is not None:
+            return existing
+        time.sleep(poll_interval_seconds)
+    return _lookup_summary_job(memory_home, session_id)
 
 
 def _check_context(

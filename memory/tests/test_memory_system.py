@@ -865,6 +865,403 @@ class MemorySystemTest(unittest.TestCase):
         self.assertEqual(patch_plan["local_ops"][0]["target_id"], "l_existing_task")
         self.assertEqual(patch_plan["local_ops"][0]["record_patch"]["status"], "open")
 
+    def test_qwen_summarizer_repairs_content_only_create_ops(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "apply",
+                                "reason": "remember the next step",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "create",
+                                        "content": "重新检查失败的 auth 快照",
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=3,
+            job_key="job-key-3",
+            session_id="session-qwen-3",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住下一步：重新检查失败的 auth 快照", "assistant_message_delta": "好"}],
+                backend="qwen",
+            )
+
+        self.assertEqual(patch_plan["decision"], "write")
+        record = patch_plan["local_ops"][0]["record"]
+        self.assertEqual(record["type"], "task_context")
+        self.assertEqual(record["status"], "open")
+        self.assertEqual(record["summary"], "重新检查失败的 auth 快照")
+        self.assertEqual(record["subject"], "重新检查失败的 auth 快照")
+
+    def test_qwen_summarizer_repairs_nested_record_content_aliases(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "update",
+                                "reason": "remember the next step",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "create",
+                                        "record": {
+                                            "type": "task_context",
+                                            "status": "open",
+                                            "content": "重新检查失败的 auth 快照",
+                                        },
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=5,
+            job_key="job-key-5",
+            session_id="session-qwen-5",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住下一步：重新检查失败的 auth 快照", "assistant_message_delta": "好"}],
+                backend="qwen",
+            )
+
+        record = patch_plan["local_ops"][0]["record"]
+        self.assertEqual(record["summary"], "重新检查失败的 auth 快照")
+        self.assertEqual(record["subject"], "重新检查失败的 auth 快照")
+        self.assertEqual(record["confidence"], "medium")
+        self.assertEqual(record["scope_reason"], "repo-specific and near-term")
+
+    def test_qwen_summarizer_rejects_irreparable_invalid_patch_plan(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "apply",
+                                "reason": "invalid create op",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [{"action": "create"}],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=4,
+            job_key="job-key-4",
+            session_id="session-qwen-4",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            with self.assertRaises(SummarizerExecutionError):
+                summarize_job(
+                    config=self.config,
+                    job=job,
+                    events=[{"user_message_delta": "你好", "assistant_message_delta": "收到"}],
+                    backend="qwen",
+                )
+
+    def test_qwen_summarizer_repairs_supersede_record_alias_and_status_alias(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "apply",
+                                "reason": "replace stale local task",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "supersede",
+                                        "target_id": "l_existing_task",
+                                        "record": {
+                                            "type": "task_context",
+                                            "status": "resolved",
+                                            "content": "新的跟进结论",
+                                        },
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=6,
+            job_key="job-key-6",
+            session_id="session-qwen-6",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "更新记忆", "assistant_message_delta": "收到"}],
+                backend="qwen",
+            )
+
+        replacement = patch_plan["local_ops"][0]["replacement_record"]
+        self.assertEqual(replacement["status"], "closed")
+        self.assertEqual(replacement["summary"], "新的跟进结论")
+        self.assertEqual(replacement["subject"], "新的跟进结论")
+
+    def test_qwen_summarizer_repairs_update_record_alias(self) -> None:
+        env_file = self._write_env(
+            [
+                "CODEX_MEMORY_SUMMARIZER_PROVIDER=qwen_openai",
+                "CODEX_MEMORY_SUMMARIZER_BASE_URL=https://example.com/compatible-mode/v1",
+                "CODEX_MEMORY_SUMMARIZER_API_KEY=test-token",
+            ]
+        )
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": "update",
+                                "reason": "refresh existing task",
+                                "base_revisions": current_base_revisions(self.config),
+                                "global_ops": [],
+                                "local_ops": [
+                                    {
+                                        "action": "update",
+                                        "id": "l_existing_task",
+                                        "record": {
+                                            "id": "l_existing_task",
+                                            "status": "open",
+                                            "content": "重新检查失败的 auth 快照",
+                                        },
+                                    }
+                                ],
+                                "needs_manual_review": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return response_payload
+
+        job = SummaryJob(
+            id=7,
+            job_key="job-key-7",
+            session_id="session-qwen-7",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_ENV_FILE": str(env_file)}, clear=False), mock.patch(
+            "requests.post",
+            return_value=FakeResponse(),
+        ):
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住下一步：重新检查失败的 auth 快照", "assistant_message_delta": "好"}],
+                backend="qwen",
+            )
+
+        record_patch = patch_plan["local_ops"][0]["record_patch"]
+        self.assertEqual(record_patch["status"], "open")
+        self.assertEqual(record_patch["summary"], "重新检查失败的 auth 快照")
+
     def test_worker_gc_deletes_old_runtime_snapshots_and_finished_jobs(self) -> None:
         old_runtime = self.config.runtime_dir / "session_old.json"
         old_runtime.write_text("{}", encoding="utf-8")

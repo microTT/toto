@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 
@@ -78,19 +79,44 @@ def _check_installed_config(hook_path: Path, mcp_path: Path, memory_home: Path) 
     hooks_path = Path.home() / ".codex" / "hooks.json"
     config_path = Path.home() / ".codex" / "config.toml"
     hooks_payload = json.loads(hooks_path.read_text(encoding="utf-8"))
-    hooks_text = json.dumps(hooks_payload, ensure_ascii=False)
-    config_text = config_path.read_text(encoding="utf-8")
-    if str(hook_path) not in hooks_text:
+    hook_commands = _collect_hook_commands(hooks_payload)
+    if not any(str(hook_path) in command for command in hook_commands):
         raise AssertionError(f"{hooks_path} does not reference {hook_path}")
-    if str(memory_home) not in hooks_text:
-        raise AssertionError(f"{hooks_path} does not pin CODEX_MEMORY_HOME={memory_home}")
-    if str(mcp_path) not in config_text:
+    for command in hook_commands:
+        if str(hook_path) in command and "CODEX_MEMORY_HOME" in command:
+            raise AssertionError(f"{hooks_path} should not pin CODEX_MEMORY_HOME in hook commands: {command}")
+
+    config_text = config_path.read_text(encoding="utf-8")
+    config_payload = tomllib.loads(config_text)
+    server = config_payload.get("mcp_servers", {}).get("memory-local")
+    if not isinstance(server, dict):
+        raise AssertionError(f"{config_path} does not define [mcp_servers.memory-local]")
+    if server.get("command") != str(mcp_path):
         raise AssertionError(f"{config_path} does not reference {mcp_path}")
-    if str(memory_home) not in config_text:
-        raise AssertionError(f"{config_path} does not pass --memory-home {memory_home}")
-    if '"--allow-writes"' not in config_text:
+
+    args = [str(item) for item in server.get("args", [])]
+    if "--allow-writes" not in args:
         raise AssertionError(f"{config_path} does not enable --allow-writes for memory-local MCP")
+    if "--memory-home" in args:
+        raise AssertionError(f"{config_path} should not pin --memory-home for memory-local MCP")
+    if "--cwd" in args:
+        raise AssertionError(f"{config_path} should not pin --cwd for memory-local MCP")
     return {"name": "installed_config", "ok": True}
+
+
+def _collect_hook_commands(payload: object) -> list[str]:
+    commands: list[str] = []
+    if isinstance(payload, dict):
+        command = payload.get("command")
+        if isinstance(command, str):
+            commands.append(command)
+        for value in payload.values():
+            commands.extend(_collect_hook_commands(value))
+        return commands
+    if isinstance(payload, list):
+        for item in payload:
+            commands.extend(_collect_hook_commands(item))
+    return commands
 
 
 def _check_mcp_stdio(mcp_path: Path, workspace: Path, memory_home: Path) -> dict[str, object]:

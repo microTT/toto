@@ -48,17 +48,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${SKIP_LIVE}" -eq 0 && -z "${MEMORY_HOME}" && -f "${HOME}/.codex/config.toml" ]]; then
-  MEMORY_HOME="$(
-    grep -Eo '"--memory-home",[[:space:]]*"[^"]+"' "${HOME}/.codex/config.toml" \
-      | sed -E 's/.*"--memory-home",[[:space:]]*"([^"]+)"/\1/' \
-      | head -n 1 || true
-  )"
-fi
-
 if [[ "${SKIP_LIVE}" -eq 0 && -z "${MEMORY_HOME}" ]]; then
-  echo "Live validation needs --memory-home (or CODEX_MEMORY_HOME / ~/.codex/config.toml)." >&2
-  exit 1
+  MEMORY_HOME="$(
+    "${MEMORY_DIR}/bin/memory-admin" --cwd "${WORKSPACE}" bootstrap \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["memory_home"])'
+  )"
 fi
 
 log_step() {

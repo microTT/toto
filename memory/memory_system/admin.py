@@ -13,9 +13,11 @@ from .constants import GLOBAL_SCOPE, LOCAL_RECENT_SCOPE
 from .migration import migrate_records_to_zh
 from .markdown_store import get_record, load_document
 from .patch_applier import apply_patch_plan, current_base_revisions
+from .repair import repair_mixed_workspace_store
 from .record_store import find_record
 from .search_index import SearchIndex, search_old_records
 from .snapshot import build_snapshot
+from .workspace_store import iter_scoped_recent_documents
 from .worker import run_worker_once
 
 
@@ -30,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("archive")
     subparsers.add_parser("migrate-zh")
     subparsers.add_parser("print-hooks-config")
+    subparsers.add_parser("repair-mixed-store")
     rebuild_parser = subparsers.add_parser("rebuild-index")
     rebuild_parser.add_argument("--json", action="store_true")
 
@@ -95,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "print-hooks-config":
         print(json.dumps(_hooks_config(config), indent=2))
+        return 0
+    if args.command == "repair-mixed-store":
+        payload = repair_mixed_workspace_store(config)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     if args.command == "rebuild-index":
         index = SearchIndex(config.index_db_path)
@@ -243,8 +250,7 @@ def _record_exists_for_scope(config, scope: str, record_id: str) -> bool:
             return False
         document = load_document(config.global_memory_path, GLOBAL_SCOPE)
         return get_record(document, record_id) is not None
-    for path in sorted(config.recent_dir.glob("*.md")):
-        document = load_document(path, LOCAL_RECENT_SCOPE)
+    for _, document in iter_scoped_recent_documents(config):
         if get_record(document, record_id) is not None:
             return True
     return False
@@ -252,7 +258,6 @@ def _record_exists_for_scope(config, scope: str, record_id: str) -> bool:
 
 def _hooks_config(config) -> dict[str, Any]:
     hook_path = str((Path(__file__).resolve().parents[1] / "bin" / "memory-hook"))
-    command_prefix = f"CODEX_MEMORY_HOME={shlex.quote(str(config.memory_home))} "
     return {
         "hooks": {
             "SessionStart": [
@@ -261,7 +266,7 @@ def _hooks_config(config) -> dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"{command_prefix}{shlex.quote(hook_path)} session-start",
+                            "command": f"{shlex.quote(hook_path)} session-start",
                             "timeout": 10,
                             "statusMessage": "Prewarming memory",
                         }
@@ -273,7 +278,7 @@ def _hooks_config(config) -> dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"{command_prefix}{shlex.quote(hook_path)} user-prompt-submit",
+                            "command": f"{shlex.quote(hook_path)} user-prompt-submit",
                             "timeout": 15,
                             "statusMessage": "Loading memory",
                         }
@@ -285,7 +290,7 @@ def _hooks_config(config) -> dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"{command_prefix}{shlex.quote(hook_path)} stop",
+                            "command": f"{shlex.quote(hook_path)} stop",
                             "timeout": 8,
                             "statusMessage": "Recording memory candidate",
                         }

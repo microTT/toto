@@ -20,6 +20,7 @@ from .search_index import SearchIndex
 from .state_db import StateDB
 from .summarizer import summarize_job
 from .utils import isoformat
+from .workspace_store import iter_peer_memory_configs
 
 
 def run_worker_once(
@@ -33,6 +34,39 @@ def run_worker_once(
     failed_job_retention_days: int = DEFAULT_FAILED_JOB_RETENTION_DAYS,
 ) -> dict[str, Any] | None:
     config = resolve_config(cwd, memory_home)
+    maintenance_result: dict[str, Any] | None = None
+    for candidate_config in iter_peer_memory_configs(config):
+        result = _run_worker_once_for_config(
+            candidate_config,
+            backend=backend,
+            retry_base_seconds=retry_base_seconds,
+            running_job_timeout_seconds=running_job_timeout_seconds,
+            completed_job_retention_days=completed_job_retention_days,
+            failed_job_retention_days=failed_job_retention_days,
+        )
+        if result is None:
+            continue
+        enriched = {
+            **result,
+            "memory_home": str(candidate_config.memory_home),
+            "workspace_root": str(candidate_config.workspace_root),
+        }
+        if result.get("job") is not None:
+            return enriched
+        if maintenance_result is None:
+            maintenance_result = enriched
+    return maintenance_result
+
+
+def _run_worker_once_for_config(
+    config,
+    *,
+    backend: str,
+    retry_base_seconds: int,
+    running_job_timeout_seconds: int,
+    completed_job_retention_days: int,
+    failed_job_retention_days: int,
+) -> dict[str, Any] | None:
     ensure_layout(config)
     current_time = datetime.now(UTC)
     archived = archive_stale_recent_documents(config, now=current_time)

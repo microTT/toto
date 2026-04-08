@@ -22,6 +22,7 @@ from .markdown_store import (
 from .models import MemoryDocument, MemoryRecord
 from .utils import isoformat, sha256_text
 from .validation import reject_secrets_in_patch_plan, validate_patch_plan
+from .workspace_store import iter_scoped_recent_documents
 
 
 def apply_patch_plan(config: MemoryConfig, patch_plan: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
@@ -115,8 +116,8 @@ def _validate_base_revisions(
 
 def _load_recent_documents(config: MemoryConfig, current_time: datetime) -> dict[Path, MemoryDocument]:
     documents: dict[Path, MemoryDocument] = {}
-    for path in sorted(config.recent_dir.glob("*.md")):
-        documents[path] = load_document(path, LOCAL_RECENT_SCOPE)
+    for path, document in iter_scoped_recent_documents(config):
+        documents[path] = document
     today_path = config.recent_dir / f"{current_time.date().isoformat()}.md"
     if today_path not in documents:
         documents[today_path] = empty_document(

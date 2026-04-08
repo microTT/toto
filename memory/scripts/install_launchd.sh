@@ -134,8 +134,6 @@ cat >"${TMP_PLIST}" <<EOF
     <string>daemon</string>
     <string>--cwd</string>
     <string>${WORKSPACE}</string>
-    <string>--memory-home</string>
-    <string>${MEMORY_HOME}</string>
     <string>--backend</string>
     <string>${BACKEND}</string>
     <string>--poll-interval</string>

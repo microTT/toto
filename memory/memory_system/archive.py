@@ -15,20 +15,20 @@ from .markdown_store import (
     save_document,
     upsert_record,
 )
+from .workspace_store import iter_scoped_recent_documents
 
 
 def archive_stale_recent_documents(config: MemoryConfig, *, now: datetime | None = None) -> list[Path]:
     current_time = now or datetime.now(UTC)
     cutoff = current_time.date() - timedelta(days=1)
     archived_paths: list[Path] = []
-    for path in sorted(config.recent_dir.glob("*.md")):
+    for path, document in iter_scoped_recent_documents(config):
         try:
             file_date = datetime.strptime(path.stem, "%Y-%m-%d").date()
         except ValueError:
             continue
         if file_date >= cutoff:
             continue
-        document = load_document(path, LOCAL_RECENT_SCOPE)
         carry_over, archive_records = _split_recent_document(document, current_time)
         if archive_records:
             archive_path = config.archive_dir / file_date.strftime("%Y") / file_date.strftime("%m") / path.name

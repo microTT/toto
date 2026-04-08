@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,9 +53,10 @@ def parse_document(text: str, scope: str) -> MemoryDocument:
     current_section: str | None = None
     current_record_id: str | None = None
     current_fields: dict[str, Any] = {}
+    last_scalar_key: str | None = None
 
     def flush_record() -> None:
-        nonlocal current_record_id, current_fields
+        nonlocal current_record_id, current_fields, last_scalar_key
         if current_record_id is None or current_section is None:
             return
         payload = dict(current_fields)
@@ -67,6 +69,7 @@ def parse_document(text: str, scope: str) -> MemoryDocument:
         sections[current_section].append(MemoryRecord.from_dict(payload))
         current_record_id = None
         current_fields = {}
+        last_scalar_key = None
 
     for line in lines[index:]:
         if line.startswith("## "):
@@ -81,8 +84,21 @@ def parse_document(text: str, scope: str) -> MemoryDocument:
             current_record_id = line[4:].strip()
             continue
         if current_record_id and line.startswith("- "):
-            key, value = _parse_bullet_field(line[2:])
+            try:
+                key, value = _parse_bullet_field(line[2:])
+            except MarkdownStoreError:
+                if _can_append_multiline_scalar(current_fields, last_scalar_key):
+                    current_fields[last_scalar_key] = _append_multiline_scalar(current_fields[last_scalar_key], line)
+                    continue
+                raise
             current_fields[key] = value
+            last_scalar_key = key if isinstance(value, str) else None
+            continue
+        if current_record_id and line and _can_append_multiline_scalar(current_fields, last_scalar_key):
+            current_fields[last_scalar_key] = _append_multiline_scalar(
+                current_fields[last_scalar_key],
+                _normalize_continuation_line(line),
+            )
     flush_record()
     return MemoryDocument(scope=scope, metadata=metadata, sections=sections)
 
@@ -178,6 +194,11 @@ def _parse_scalar(value: str) -> Any:
         return None
     if value in {"true", "false"}:
         return value == "true"
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            pass
     if value.startswith("[") and value.endswith("]"):
         inner = value[1:-1].strip()
         if not inner:
@@ -223,7 +244,28 @@ def _render_scalar(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, list):
         return "[" + ", ".join(f'"{item}"' for item in value) + "]"
+    if isinstance(value, str) and "\n" in value:
+        return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _can_append_multiline_scalar(fields: dict[str, Any], key: str | None) -> bool:
+    return key is not None and isinstance(fields.get(key), str)
+
+
+def _append_multiline_scalar(current: str, line: str) -> str:
+    clean_line = line.rstrip()
+    if not clean_line:
+        return current
+    if not current:
+        return clean_line
+    return f"{current}\n{clean_line}"
+
+
+def _normalize_continuation_line(line: str) -> str:
+    if line.startswith("  "):
+        return line[2:]
+    return line
 
 
 def _section_to_status(section: str) -> str:

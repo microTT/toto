@@ -19,12 +19,13 @@ if str(ROOT) not in sys.path:
 from memory_system.admin import main as admin_main
 from memory_system.archive import archive_stale_recent_documents
 from memory_system.bootstrap import ensure_layout
-from memory_system.config import MemoryConfig, resolve_config
+from memory_system.config import MemoryConfig, compute_workspace_identity, resolve_config
 from memory_system.constants import GLOBAL_SCOPE, LOCAL_RECENT_SCOPE, STATUS_ACTIVE, STATUS_OPEN, STATUS_SUPERSEDED
 from memory_system.embedding import embed_document_text, embed_query_text, load_embedding_settings
 from memory_system.errors import PatchApplyError, SummarizerExecutionError
 from memory_system.hooks import run_hook
-from memory_system.markdown_store import all_records, load_document
+from memory_system.markdown_store import all_records, empty_document, load_document, save_document
+from memory_system.models import MemoryRecord
 from memory_system.patch_applier import apply_patch_plan, current_base_revisions
 from memory_system.record_store import find_record
 from memory_system.search_index import SearchIndex, search_old_records
@@ -216,12 +217,13 @@ class MemorySystemTest(unittest.TestCase):
     def test_same_repo_search_federates_across_peer_memory_homes(self) -> None:
         peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
         peer_workspace.mkdir(parents=True, exist_ok=True)
+        peer_identity = compute_workspace_identity(peer_workspace)
         peer_config = MemoryConfig(
-            memory_home=Path(self.temp_dir.name) / "memory-peer",
-            workspace_root=peer_workspace,
-            cwd=peer_workspace,
+            memory_home=Path(self.temp_dir.name) / peer_identity.workspace_instance_id,
+            workspace_root=peer_identity.workspace_root,
+            cwd=peer_identity.workspace_root,
             repo_id=self.config.repo_id,
-            workspace_instance_id="wsi_peer000001",
+            workspace_instance_id=peer_identity.workspace_instance_id,
         )
         ensure_layout(peer_config)
         peer_plan = {
@@ -269,7 +271,87 @@ class MemorySystemTest(unittest.TestCase):
         )
         self.assertEqual(current_scope_results, [])
         self.assertEqual(same_repo_results[0]["record_id"], "l_peer_closed")
-        self.assertEqual(same_repo_results[0]["workspace_instance_id"], "wsi_peer000001")
+        self.assertEqual(same_repo_results[0]["workspace_instance_id"], peer_identity.workspace_instance_id)
+
+    def test_snapshot_ignores_foreign_recent_documents_in_shared_memory_home(self) -> None:
+        foreign_workspace = Path(self.temp_dir.name) / "workspace-foreign"
+        foreign_workspace.mkdir(parents=True, exist_ok=True)
+        foreign_config = resolve_config(foreign_workspace)
+        ensure_layout(foreign_config)
+        foreign_path = self.config.recent_dir / "peer.md"
+        foreign_document = empty_document(
+            LOCAL_RECENT_SCOPE,
+            path=foreign_path,
+            metadata={
+                "repo_id": foreign_config.repo_id,
+                "workspace_instance_id": foreign_config.workspace_instance_id,
+                "workspace_root": str(foreign_config.workspace_root),
+                "date": "2026-04-08",
+            },
+        )
+        foreign_document.sections["Open"].append(
+            MemoryRecord(
+                id="l_foreign_recent",
+                type="task_context",
+                status="open",
+                confidence="high",
+                subject="foreign workspace note",
+                summary="This record should not appear in the current workspace snapshot.",
+                scope_reason="repo-specific and near-term",
+            )
+        )
+        save_document(foreign_path, foreign_document)
+
+        snapshot = build_snapshot(self.config, now=_dt("2026-04-08T12:00:00Z"))
+        self.assertNotIn("foreign workspace note", snapshot.rendered_text)
+
+    def test_search_index_uses_document_metadata_in_shared_memory_home(self) -> None:
+        foreign_workspace = Path(self.temp_dir.name) / "workspace-foreign"
+        foreign_workspace.mkdir(parents=True, exist_ok=True)
+        foreign_config = resolve_config(foreign_workspace)
+        ensure_layout(foreign_config)
+        archive_path = self.config.archive_dir / "2020" / "01" / "foreign.md"
+        archive_document = empty_document(
+            "local_archive",
+            path=archive_path,
+            metadata={
+                "repo_id": foreign_config.repo_id,
+                "workspace_instance_id": foreign_config.workspace_instance_id,
+                "workspace_root": str(foreign_config.workspace_root),
+                "date": "2020-01-01",
+            },
+        )
+        archive_document.sections["Closed"].append(
+            MemoryRecord(
+                id="l_foreign_archive",
+                type="failed_attempt",
+                status="closed",
+                confidence="high",
+                subject="foreign archive entry",
+                summary="Only the foreign workspace should be able to search this record.",
+                scope_reason="repo-specific and near-term",
+            )
+        )
+        save_document(archive_path, archive_document)
+
+        index = SearchIndex(self.config.index_db_path)
+        try:
+            index.rebuild(self.config)
+            current_results = index.search_old(
+                workspace_instance_id=self.config.workspace_instance_id,
+                query="foreign archive entry",
+                top_k=5,
+            )
+            foreign_results = index.search_old(
+                workspace_instance_id=foreign_config.workspace_instance_id,
+                query="foreign archive entry",
+                top_k=5,
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(current_results, [])
+        self.assertEqual(foreign_results[0]["record_id"], "l_foreign_archive")
 
     def test_hook_to_worker_flow(self) -> None:
         run_hook(
@@ -307,6 +389,253 @@ class MemorySystemTest(unittest.TestCase):
         self.assertTrue(worker_result["applied"])
         snapshot = build_snapshot(self.config)
         self.assertIn("revisit the failing auth snapshot", snapshot.rendered_text)
+
+    def test_worker_once_scans_peer_memory_homes(self) -> None:
+        peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
+        peer_workspace.mkdir(parents=True, exist_ok=True)
+        peer_identity = compute_workspace_identity(peer_workspace)
+        peer_memory_home = Path(self.temp_dir.name) / peer_identity.workspace_instance_id
+        with mock.patch.dict(os.environ, {"CODEX_MEMORY_HOME": str(peer_memory_home)}, clear=False):
+            peer_config = resolve_config(peer_workspace)
+            ensure_layout(peer_config)
+            run_hook(
+                "session-start",
+                {
+                    "session_id": "peer-session",
+                    "turn_id": "turn-0",
+                    "cwd": str(peer_workspace),
+                },
+            )
+            run_hook(
+                "stop",
+                {
+                    "session_id": "peer-session",
+                    "turn_id": "turn-1",
+                    "cwd": str(peer_workspace),
+                    "user_message_delta": "remember next step: peer workspace follow-up",
+                    "assistant_message_delta": "Will keep that peer task in mind.",
+                },
+            )
+
+        worker_result = run_worker_once(str(self.workspace), memory_home=str(self.memory_home), backend="heuristic")
+        self.assertTrue(worker_result["applied"])
+        self.assertEqual(Path(worker_result["workspace_root"]), peer_workspace.resolve())
+
+        peer_snapshot = build_snapshot(peer_config)
+        self.assertIn("peer workspace follow-up", peer_snapshot.rendered_text)
+
+    def test_repair_mixed_store_moves_foreign_records_by_source_ref(self) -> None:
+        foreign_workspace = Path(self.temp_dir.name) / "workspace-foreign"
+        foreign_workspace.mkdir(parents=True, exist_ok=True)
+        foreign_identity = compute_workspace_identity(foreign_workspace)
+        foreign_config = MemoryConfig(
+            memory_home=Path(self.temp_dir.name) / foreign_identity.workspace_instance_id,
+            workspace_root=foreign_identity.workspace_root,
+            cwd=foreign_identity.workspace_root,
+            repo_id=foreign_identity.repo_id,
+            workspace_instance_id=foreign_identity.workspace_instance_id,
+        )
+        ensure_layout(foreign_config)
+        mixed_path = self.config.recent_dir / "2026-04-08.md"
+        mixed_document = empty_document(
+            LOCAL_RECENT_SCOPE,
+            path=mixed_path,
+            metadata={
+                "repo_id": self.config.repo_id,
+                "workspace_instance_id": self.config.workspace_instance_id,
+                "workspace_root": str(self.config.workspace_root),
+                "date": "2026-04-08",
+            },
+        )
+        source_ref = foreign_workspace / "README.md"
+        mixed_document.sections["Open"].append(
+            MemoryRecord(
+                id="l_foreign_source_ref",
+                type="task_context",
+                status="open",
+                confidence="high",
+                subject="foreign source ref record",
+                summary="This record belongs to the foreign workspace.",
+                source_refs=[str(source_ref)],
+                scope_reason="repo-specific and near-term",
+            )
+        )
+        save_document(mixed_path, mixed_document)
+
+        payload = json.loads(self._run_admin(["--cwd", str(self.workspace), "repair-mixed-store"]))
+        moved_ids = {item["record_id"] for item in payload["moved_records"]}
+        self.assertIn("l_foreign_source_ref", moved_ids)
+
+        current_snapshot = build_snapshot(self.config, now=_dt("2026-04-08T12:00:00Z"))
+        self.assertNotIn("foreign source ref record", current_snapshot.rendered_text)
+
+        foreign_snapshot = build_snapshot(foreign_config, now=_dt("2026-04-08T12:00:00Z"))
+        self.assertIn("foreign source ref record", foreign_snapshot.rendered_text)
+
+    def test_repair_mixed_store_uses_event_probes_for_non_repo_paths(self) -> None:
+        foreign_workspace = Path(self.temp_dir.name) / "workspace-foreign"
+        foreign_workspace.mkdir(parents=True, exist_ok=True)
+        foreign_identity = compute_workspace_identity(foreign_workspace)
+        foreign_config = MemoryConfig(
+            memory_home=Path(self.temp_dir.name) / foreign_identity.workspace_instance_id,
+            workspace_root=foreign_identity.workspace_root,
+            cwd=foreign_identity.workspace_root,
+            repo_id=foreign_identity.repo_id,
+            workspace_instance_id=foreign_identity.workspace_instance_id,
+        )
+        ensure_layout(foreign_config)
+        probe_path = Path(self.temp_dir.name) / "shared" / "tide.pem"
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        probe_path.write_text("pem", encoding="utf-8")
+
+        state = StateDB(self.config.state_db_path)
+        try:
+            state.append_event(
+                session_id="foreign-session",
+                turn_id="turn-1",
+                event_name="Stop",
+                event_time="2026-04-08T03:46:29Z",
+                cwd=str(foreign_workspace),
+                transcript_path=None,
+                user_message_delta=f"copy {probe_path} into the current repo and remove aws-mm.pem",
+                assistant_message_delta=None,
+                summary_cursor_before=None,
+                summary_cursor_after=None,
+                payload={},
+            )
+        finally:
+            state.close()
+
+        mixed_path = self.config.recent_dir / "2026-04-08.md"
+        mixed_document = empty_document(
+            LOCAL_RECENT_SCOPE,
+            path=mixed_path,
+            metadata={
+                "repo_id": self.config.repo_id,
+                "workspace_instance_id": self.config.workspace_instance_id,
+                "workspace_root": str(self.config.workspace_root),
+                "date": "2026-04-08",
+            },
+        )
+        mixed_document.sections["Open"].append(
+            MemoryRecord(
+                id="l_foreign_event_match",
+                type="task_context",
+                status="open",
+                confidence="high",
+                subject="shared pem migration",
+                summary=f"Copy {probe_path} into the current repo and update gitignore.",
+                created_at="2026-04-08T03:46:49Z",
+                updated_at="2026-04-08T03:46:49Z",
+                scope_reason="repo-specific and near-term",
+            )
+        )
+        save_document(mixed_path, mixed_document)
+
+        payload = json.loads(self._run_admin(["--cwd", str(self.workspace), "repair-mixed-store"]))
+        moved_ids = {item["record_id"] for item in payload["moved_records"]}
+        self.assertIn("l_foreign_event_match", moved_ids)
+
+        foreign_snapshot = build_snapshot(foreign_config, now=_dt("2026-04-08T12:00:00Z"))
+        self.assertIn("shared pem migration", foreign_snapshot.rendered_text)
+
+    def test_multiline_summary_round_trips_through_markdown_store(self) -> None:
+        path = self.config.recent_dir / "2026-04-07.md"
+        document = empty_document(
+            LOCAL_RECENT_SCOPE,
+            path=path,
+            metadata={
+                "repo_id": self.config.repo_id,
+                "workspace_instance_id": self.config.workspace_instance_id,
+                "workspace_root": str(self.config.workspace_root),
+                "date": "2026-04-07",
+            },
+        )
+        summary = "\n".join(
+            [
+                "为 agent 接入内网 ATA 搜索，推荐采用受控代理层架构：agent → 检索网关 → ATA。",
+                "- 个人助手类 agent：用户登录后显式授权，网关代发短期 token。",
+                "- 平台级 agent：使用服务账号 + 网关代理。",
+                "关键原则：凭证短期有效、权限最小化、全链路审计。",
+            ]
+        )
+        record = MemoryRecord(
+            id="l_multiline_summary",
+            type="task_context",
+            status="open",
+            confidence="high",
+            subject="内网 ATA 搜索的 agent 授权方案",
+            summary=summary,
+            scope_reason="repo-specific and near-term",
+        )
+        document.sections["Open"].append(record)
+        save_document(path, document)
+
+        loaded = load_document(path, LOCAL_RECENT_SCOPE)
+        loaded_record = next(record for record in all_records(loaded) if record.id == "l_multiline_summary")
+        self.assertEqual(loaded_record.summary, summary)
+
+    def test_parse_legacy_multiline_bullets_inside_summary(self) -> None:
+        path = self.config.recent_dir / "2026-04-07.md"
+        path.write_text(
+            "\n".join(
+                [
+                    "---",
+                    "date: 2026-04-07",
+                    f"repo_id: {self.config.repo_id}",
+                    "revision: 18",
+                    "schema_version: 1",
+                    "scope: local_recent",
+                    "updated_at: 2026-04-07T08:42:50Z",
+                    f"workspace_instance_id: {self.config.workspace_instance_id}",
+                    f"workspace_root: {self.config.workspace_root}",
+                    "---",
+                    "",
+                    "# Local Memory - 2026-04-07",
+                    "",
+                    "## Open",
+                    "",
+                    "### l_legacy_multiline_summary",
+                    "- type: task_context",
+                    "- status: open",
+                    "- confidence: high",
+                    "- subject: 内网 ATA 搜索的 agent 授权方案",
+                    "- summary: 为 agent 接入内网 ATA 搜索，推荐采用受控代理层架构：agent → 检索网关 → ATA。具体建议：",
+                    "- 个人助手类 agent：用户登录后显式授权，网关代发短期 token，高危操作需 HITL。",
+                    "- 平台级 agent：使用服务账号 + 网关代理，权限最小化。",
+                    "关键原则：凭证短期有效、权限最小化、全链路审计。",
+                    '- tags: ["ata", "agent", "authorization"]',
+                    "- created_at: 2026-04-07T08:27:11Z",
+                    "- updated_at: 2026-04-07T08:42:50Z",
+                    "- scope_reason: repo-specific and near-term",
+                    "",
+                    "## Active",
+                    "",
+                    "## Closed",
+                    "",
+                    "## Superseded",
+                    "",
+                    "## Deleted",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = load_document(path, LOCAL_RECENT_SCOPE)
+        loaded_record = next(record for record in all_records(loaded) if record.id == "l_legacy_multiline_summary")
+        self.assertEqual(
+            loaded_record.summary,
+            "\n".join(
+                [
+                    "为 agent 接入内网 ATA 搜索，推荐采用受控代理层架构：agent → 检索网关 → ATA。具体建议：",
+                    "- 个人助手类 agent：用户登录后显式授权，网关代发短期 token，高危操作需 HITL。",
+                    "- 平台级 agent：使用服务账号 + 网关代理，权限最小化。",
+                    "关键原则：凭证短期有效、权限最小化、全链路审计。",
+                ]
+            ),
+        )
+        self.assertEqual(loaded_record.tags, ["ata", "agent", "authorization"])
 
     def test_migrate_zh_translates_existing_memory_records(self) -> None:
         self._run_admin(

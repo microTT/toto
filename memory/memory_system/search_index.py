@@ -9,6 +9,7 @@ from .config import MemoryConfig
 from .constants import GLOBAL_SCOPE, LOCAL_ARCHIVE_SCOPE, LOCAL_RECENT_SCOPE
 from .embedding import cosine_similarity, embed_document_text, embed_query_text
 from .markdown_store import all_records, load_document
+from .workspace_store import document_repo_id, document_workspace_instance_id
 
 
 class SearchIndex:
@@ -51,23 +52,11 @@ class SearchIndex:
         self.conn.execute("DELETE FROM records")
         self.conn.execute("DELETE FROM records_fts")
         count = 0
-        count += self._index_document(
-            config.global_memory_path, GLOBAL_SCOPE, repo_id=None, workspace_instance_id=None
-        )
+        count += self._index_document(config.global_memory_path, GLOBAL_SCOPE)
         for path in sorted(config.recent_dir.glob("*.md")):
-            count += self._index_document(
-                path,
-                LOCAL_RECENT_SCOPE,
-                repo_id=config.repo_id,
-                workspace_instance_id=config.workspace_instance_id,
-            )
+            count += self._index_document(path, LOCAL_RECENT_SCOPE)
         for path in sorted(config.archive_dir.glob("*/*/*.md")):
-            count += self._index_document(
-                path,
-                LOCAL_ARCHIVE_SCOPE,
-                repo_id=config.repo_id,
-                workspace_instance_id=config.workspace_instance_id,
-            )
+            count += self._index_document(path, LOCAL_ARCHIVE_SCOPE)
         self.conn.commit()
         return count
 
@@ -190,13 +179,12 @@ class SearchIndex:
         self,
         path: Path,
         scope: str,
-        *,
-        repo_id: str | None,
-        workspace_instance_id: str | None,
     ) -> int:
         if not path.exists():
             return 0
         document = load_document(path, scope)
+        repo_id = None if scope == GLOBAL_SCOPE else document_repo_id(document)
+        workspace_instance_id = None if scope == GLOBAL_SCOPE else document_workspace_instance_id(document)
         count = 0
         for record in all_records(document):
             content = "\n".join(

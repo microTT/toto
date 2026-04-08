@@ -17,13 +17,15 @@ from .constants import (
 from .markdown_store import all_records, empty_document, load_document
 from .models import MemoryRecord, Snapshot
 from .utils import estimate_tokens, isoformat, sha256_text
+from .workspace_store import iter_scoped_recent_documents
 
 
 def build_snapshot(config: MemoryConfig, *, now: datetime | None = None) -> Snapshot:
     current_time = now or datetime.now(UTC)
     global_document = load_document(config.global_memory_path, GLOBAL_SCOPE)
-    recent_files = sorted(config.recent_dir.glob("*.md"))
-    recent_documents = [load_document(path, LOCAL_RECENT_SCOPE) for path in recent_files]
+    recent_entries = list(iter_scoped_recent_documents(config))
+    recent_files = [path for path, _ in recent_entries]
+    recent_documents = [document for _, document in recent_entries]
 
     global_records = [record for record in global_document.sections.get("Active", []) if record.status == STATUS_ACTIVE]
     local_records = _select_local_recent_records(recent_documents, current_time)

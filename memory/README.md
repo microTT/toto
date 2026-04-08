@@ -2,7 +2,7 @@
 
 This directory contains a self-contained local memory system for Codex-style workflows.
 
-By default, the system stores control state in `~/.codex/memories/<workspace_instance_id>`. If that location is not writable, it falls back to `<workspace>/.memory-system`. For real `workspace-write` Codex sessions, explicitly pinning `CODEX_MEMORY_HOME` to the same path keeps hooks, worker, and MCP on one store.
+By default, the system stores control state in `~/.codex/memories/<workspace_instance_id>`. If that location is not writable, it falls back to `<workspace>/.memory-system`. Installed global hooks and the `memory-local` MCP should resolve this path per workspace; do not hardcode a single `CODEX_MEMORY_HOME`, `--cwd`, or `--memory-home` in global Codex config, or multiple repositories will share one store.
 
 Within `memory_home`, the layout is:
 
@@ -69,6 +69,8 @@ memory/bin/memory-admin --cwd /path/to/workspace context
 memory/bin/memory-admin --cwd /path/to/workspace print-hooks-config
 ```
 
+The generated hooks are workspace-dynamic. They intentionally do not export `CODEX_MEMORY_HOME`; `memory-hook` resolves the correct `memory_home` from the current hook payload `cwd`.
+
 Before using hooks, ensure the feature is enabled:
 
 ```bash
@@ -85,13 +87,13 @@ memory/bin/memory-admin --cwd /path/to/workspace rebuild-index --json
 7. Run one worker pass:
 
 ```bash
-memory/bin/memoryd run-once --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend heuristic
+memory/bin/memoryd run-once --cwd /path/to/workspace --backend heuristic
 ```
 
 8. Run the worker as a daemon:
 
 ```bash
-memory/bin/memoryd daemon --cwd /path/to/workspace --memory-home ~/.codex/memories/<workspace_instance_id> --backend qwen --poll-interval 5
+memory/bin/memoryd daemon --cwd /path/to/workspace --backend qwen --poll-interval 5
 ```
 
 9. Optional Qwen summarizer + embedding configuration in `memory/.env`:
@@ -139,6 +141,12 @@ Embedding-specific behavior:
 memory/scripts/validate_installed_stack.py \
   --workspace /path/to/workspace \
   --memory-home ~/.codex/memories/<workspace_instance_id>
+```
+
+If you do not already know the workspace-specific home, derive it first:
+
+```bash
+memory/bin/memory-admin --cwd /path/to/workspace bootstrap
 ```
 
 ## Tests

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Session Viewer</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23f0dfc8'/%3E%3Cpath d='M18 20h28v6H18zm0 10h28v6H18zm0 10h18v6H18z' fill='%231e6b68'/%3E%3Ccircle cx='46' cy='43' r='6' fill='%23ae5a2a'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Codex Session Intelligence</p>
+          <h1>Session Viewer</h1>
+          <p class="subhead">
+            为 prompt 取证和会话审计设计的本地工作台。按日期、session、message flow 追踪输入构成、注入上下文和执行轨迹。
+          </p>
+        </div>
+        <div class="header-actions">
+          <button id="refreshButton" class="ghost-button">刷新</button>
+          <div id="healthBadge" class="status-badge" aria-live="polite">Loading</div>
+        </div>
+      </header>
+
+      <section class="top-strip">
+        <div class="summary-card">
+          <span>Sessions</span>
+          <strong id="sessionCount">-</strong>
+        </div>
+        <div class="summary-card">
+          <span>Turns</span>
+          <strong id="turnCount">-</strong>
+        </div>
+        <div class="summary-card">
+          <span>Peak Prompt Tokens</span>
+          <strong id="peakTokens">-</strong>
+        </div>
+        <div class="summary-card wide">
+          <span>Sessions Root</span>
+          <strong id="sessionsRoot">-</strong>
+        </div>
+      </section>
+
+      <section class="control-bar">
+        <div class="search-cluster">
+          <label class="search-box">
+            <span>检索 session / cwd / prompt</span>
+            <input
+              id="searchInput"
+              name="session-search"
+              type="search"
+              placeholder="例如：prompt、memory、某条用户问题"
+            />
+          </label>
+          <div class="lens-box">
+            <span>Session Lens</span>
+            <div id="kindFilters" class="filter-row" aria-label="Session filters"></div>
+          </div>
+        </div>
+        <p id="activeLens" class="active-lens">正在载入会话索引…</p>
+      </section>
+
+      <main class="workspace">
+        <aside class="panel sessions-panel">
+          <div class="panel-header">
+            <h2>Sessions</h2>
+            <p>按日期聚合，优先展示最近的对话。</p>
+          </div>
+          <div id="sessionsList" class="scroll-area"></div>
+        </aside>
+
+        <section class="panel turns-panel">
+          <div class="panel-header">
+            <h2>Messages</h2>
+            <p id="turnsMeta">选择一个 session 后显示消息流。</p>
+          </div>
+          <div id="turnsList" class="scroll-area"></div>
+        </section>
+
+        <section class="panel detail-panel">
+          <div class="panel-header">
+            <h2>Prompt Lens</h2>
+            <p id="detailMeta">选择一条 message 查看细节。</p>
+          </div>
+          <div id="turnDetail" class="scroll-area detail-scroll"></div>
+        </section>
+      </main>
+    </div>
+
+    <template id="emptyStateTemplate">
+      <div class="empty-state">
+        <h3>还没有可展示的数据</h3>
+        <p>确认 `~/.codex/sessions` 下存在 `.jsonl` 会话文件。</p>
+      </div>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+  </html>

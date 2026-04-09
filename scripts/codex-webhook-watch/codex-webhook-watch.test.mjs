@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +32,72 @@ async function runWatcher(lines, extraArgs = []) {
     ]);
 
     return stdout;
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runWatcherWithAppend(initialLines, appendedLines, extraArgs = []) {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "codex-watch-"));
+
+  try {
+    const sessionFile = path.join(rootDir, "session.jsonl");
+    await writeFile(sessionFile, `${initialLines.join("\n")}\n`, "utf8");
+
+    const child = spawn(process.execPath, [
+      scriptPath,
+      "--dry-run",
+      "--interval",
+      "50",
+      "--approval-wait",
+      "0",
+      "--root",
+      rootDir,
+      ...extraArgs,
+    ]);
+
+    let stdout = "";
+    let stderr = "";
+    let readyResolve;
+    let readyReject;
+    const ready = new Promise((resolve, reject) => {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+    const readyTimer = setTimeout(() => {
+      readyReject(new Error("watcher did not become ready in time"));
+    }, 2000);
+
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString("utf8");
+      if (stderr.includes("Watching ")) {
+        clearTimeout(readyTimer);
+        readyResolve();
+      }
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(readyTimer);
+      readyReject(new Error(`watcher exited before ready: code=${code} signal=${signal}`));
+    });
+
+    try {
+      await ready;
+      await sleep(150);
+      await appendFile(sessionFile, `${appendedLines.join("\n")}\n`, "utf8");
+      await sleep(400);
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise(resolve => child.once("exit", resolve));
+    }
+
+    return { stdout, stderr };
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }
@@ -84,6 +150,17 @@ function buildTaskCompleteRecords() {
       },
     }),
   ];
+}
+
+function buildSessionMetaRecord(extraPayload = {}) {
+  return JSON.stringify({
+    timestamp: "2026-03-31T00:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: "sess-1",
+      ...extraPayload,
+    },
+  });
 }
 
 test("does not notify for pending chrome_devtools MCP approvals by default", async () => {
@@ -299,4 +376,79 @@ test("suppresses task completion when the next task already started", async () =
   ]);
 
   assert.doesNotMatch(stdout, /task_complete/);
+});
+
+test("does not notify for guardian subagent task completion", async () => {
+  const stdout = await runWatcher([
+    buildSessionMetaRecord({
+      source: {
+        subagent: {
+          other: "guardian",
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "{\"risk_level\":\"low\"}",
+      },
+    }),
+  ], [
+    "--task-complete-wait",
+    "0",
+  ]);
+
+  assert.doesNotMatch(stdout, /task_complete/);
+});
+
+test("keeps ignoring subagent sessions when attached after file creation", async () => {
+  const { stdout } = await runWatcherWithAppend([
+    buildSessionMetaRecord({
+      source: {
+        subagent: {
+          other: "guardian",
+        },
+      },
+    }),
+  ], [
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "{\"risk_level\":\"low\"}",
+      },
+    }),
+  ], [
+    "--task-complete-wait",
+    "0",
+  ]);
+
+  assert.doesNotMatch(stdout, /task_complete/);
+});
+
+test("still notifies for main session task completion after initial attach", async () => {
+  const { stdout } = await runWatcherWithAppend([
+    buildSessionMetaRecord(),
+  ], [
+    JSON.stringify({
+      timestamp: "2026-03-31T00:00:00.100Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "final answer",
+      },
+    }),
+  ], [
+    "--task-complete-wait",
+    "0",
+  ]);
+
+  assert.match(stdout, /task_complete/);
+  assert.match(stdout, /final answer/);
 });

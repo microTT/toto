@@ -184,6 +184,57 @@ function parseSessionIdFromPath(filePath) {
   return base.slice(marker + 1);
 }
 
+function normalizeSessionSource(source) {
+  if (typeof source === "string" && source) {
+    return {
+      kind: source,
+      label: source,
+    };
+  }
+
+  const subagent = source?.subagent?.other ?? source?.subagent?.name ?? null;
+  if (subagent === "guardian") {
+    return {
+      kind: "guardian",
+      label: "guardian",
+    };
+  }
+  if (subagent) {
+    return {
+      kind: "subagent",
+      label: String(subagent),
+    };
+  }
+
+  return {
+    kind: "main",
+    label: null,
+  };
+}
+
+function applySessionMeta(record, state) {
+  if (record?.type !== "session_meta" || !record.payload) {
+    return false;
+  }
+
+  if (record.payload.id) {
+    state.sessionId = record.payload.id;
+  }
+
+  const source = normalizeSessionSource(record.payload.source);
+  state.sessionSource = source;
+  state.sessionMetaKnown = true;
+  state.ignoredSession = source.kind === "guardian" || source.kind === "subagent";
+
+  if (state.ignoredSession) {
+    state.pendingApprovals.clear();
+    state.pendingTaskComplete = null;
+    state.remainder = "";
+  }
+
+  return true;
+}
+
 function buildTaskCompleteEvent(pending, state) {
   return {
     event: "task_complete",
@@ -438,6 +489,54 @@ function cleanupTaskCompleteState(record, state) {
   }
 }
 
+async function readFirstJsonlLine(filePath, maxBytes = 1024 * 1024) {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const chunkSize = 64 * 1024;
+    let position = 0;
+    let collected = "";
+
+    while (position < maxBytes) {
+      const remaining = maxBytes - position;
+      const buffer = Buffer.alloc(Math.min(chunkSize, remaining));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead <= 0) {
+        break;
+      }
+
+      collected += buffer.toString("utf8", 0, bytesRead);
+      const newlineIndex = collected.indexOf("\n");
+      if (newlineIndex !== -1) {
+        return collected.slice(0, newlineIndex);
+      }
+
+      position += bytesRead;
+    }
+
+    return collected || null;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function primeSessionMeta(filePath, state) {
+  if (state.sessionMetaKnown) {
+    return;
+  }
+
+  const firstLine = await readFirstJsonlLine(filePath);
+  if (!firstLine?.trim()) {
+    return;
+  }
+
+  const record = safeJsonParse(firstLine);
+  if (!record) {
+    return;
+  }
+
+  applySessionMeta(record, state);
+}
+
 async function postWebhook(url, payload) {
   const response = await fetch(url, {
     method: "POST",
@@ -587,6 +686,9 @@ async function maybeEmitPendingApprovals(state, options) {
   if (!options.events.has("approval_needed")) {
     return;
   }
+  if (!state.sessionMetaKnown || state.ignoredSession) {
+    return;
+  }
 
   const nowMs = Date.now();
   for (const pending of state.pendingApprovals.values()) {
@@ -609,6 +711,9 @@ async function maybeEmitPendingTaskComplete(state, options) {
   if (!options.events.has("task_complete")) {
     return;
   }
+  if (!state.sessionMetaKnown || state.ignoredSession) {
+    return;
+  }
 
   const pending = state.pendingTaskComplete;
   if (!pending || pending.notified) {
@@ -627,6 +732,10 @@ async function maybeEmitPendingTaskComplete(state, options) {
 }
 
 async function handleRecord(record, state, options, filePath) {
+  if (applySessionMeta(record, state)) {
+    return;
+  }
+
   const approvedPrefixRules = extractApprovedPrefixRules(record);
   if (approvedPrefixRules) {
     state.approvedPrefixRules = approvedPrefixRules;
@@ -634,11 +743,6 @@ async function handleRecord(record, state, options, filePath) {
 
   cleanupApprovalState(record, state);
   cleanupTaskCompleteState(record, state);
-
-  if (record?.type === "session_meta" && record.payload?.id) {
-    state.sessionId = record.payload.id;
-  }
-
   if (record?.type === "event_msg" && record.payload?.type === "task_started") {
     state.currentTurnId = record.payload.turn_id || state.currentTurnId;
   }
@@ -686,9 +790,17 @@ async function processFile(filePath, state, options) {
     throw error;
   }
 
+  await primeSessionMeta(filePath, state);
+
   if (!state.initialized) {
     state.offset = options.replay ? 0 : stats.size;
     state.initialized = true;
+  }
+
+  if (state.ignoredSession) {
+    state.offset = stats.size;
+    state.remainder = "";
+    return;
   }
 
   if (stats.size < state.offset) {
@@ -740,6 +852,9 @@ async function main() {
       if (!states.has(filePath)) {
         states.set(filePath, {
           sessionId: parseSessionIdFromPath(filePath),
+          sessionMetaKnown: false,
+          sessionSource: null,
+          ignoredSession: false,
           currentTurnId: null,
           currentCwd: null,
           approvedPrefixRules: [],

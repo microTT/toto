@@ -19,6 +19,7 @@
 - `task_complete`
   - Codex 完成一个回合后，不会立刻发送
   - 只有在短暂空闲窗口后，且期间没有新的 `user_message` / `task_started`，才发送通知
+  - `guardian` / 其他 `subagent` 会话文件会被忽略，不会把内部审批评估或子代理回合误报成主任务完成
   - 目的：压掉同一 session 内很快继续追问、澄清、补充导致的“中间态完成”通知
 - `approval_needed`
   - 只对“看起来真的在等人审批”的提权请求发送通知

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Memory Atlas</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23f4efe4'/%3E%3Cpath d='M19 18h26a5 5 0 0 1 5 5v22a5 5 0 0 1-5 5H19z' fill='%23152120'/%3E%3Cpath d='M24 24h16v4H24zm0 9h16v4H24zm0 9h11v4H24z' fill='%23f4efe4'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Local Memory Observatory</p>
+          <h1>Memory Atlas</h1>
+          <p class="hero-text">
+            浏览当前工作区与同目录其他 workspace 的全局记忆、近期记忆、归档记忆，以及最近一次注入给模型的 snapshot。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshButton" class="ghost-button">刷新</button>
+          <div id="healthBadge" class="status-pill">Loading</div>
+        </div>
+      </header>
+
+      <section class="summary-strip">
+        <article class="summary-card">
+          <span>Workspaces</span>
+          <strong id="workspaceCount">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>Visible Records</span>
+          <strong id="visibleCount">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>Current Workspace</span>
+          <strong id="currentWorkspace">-</strong>
+        </article>
+        <article class="summary-card wide">
+          <span>Memory Homes</span>
+          <strong id="memoryHomeParent">-</strong>
+        </article>
+      </section>
+
+      <section class="control-bar">
+        <label class="search-box">
+          <span>检索 subject / summary / tags</span>
+          <input
+            id="searchInput"
+            type="search"
+            placeholder="例如：git、launchd、auth snapshot"
+          />
+        </label>
+        <div class="filter-box">
+          <span>Scope</span>
+          <div id="scopeFilters" class="chip-row"></div>
+        </div>
+        <div class="filter-box">
+          <span>Status</span>
+          <div id="statusFilters" class="chip-row"></div>
+        </div>
+      </section>
+
+      <main class="workspace-grid">
+        <aside class="panel workspaces-panel">
+          <div class="panel-header">
+            <h2>Workspaces</h2>
+            <p>同一个 `~/.codex/memories` 目录下可发现的记忆空间。</p>
+          </div>
+          <div id="workspaceList" class="panel-scroll"></div>
+        </aside>
+
+        <section class="panel records-panel">
+          <div class="panel-header">
+            <h2>Records</h2>
+            <p id="recordsMeta">选择 workspace 后显示所有记忆记录。</p>
+          </div>
+          <div id="recordList" class="panel-scroll"></div>
+        </section>
+
+        <section class="panel detail-panel">
+          <div class="panel-header">
+            <h2>Detail</h2>
+            <p id="detailMeta">选择一条记忆查看完整字段与当前 snapshot。</p>
+          </div>
+          <div id="detailPane" class="panel-scroll detail-scroll"></div>
+        </section>
+      </main>
+    </div>
+
+    <template id="emptyStateTemplate">
+      <div class="empty-state">
+        <h3>没有可展示的数据</h3>
+        <p>确认当前 workspace 的 memory store 已 bootstrap，并且存在 recent/global 文件。</p>
+      </div>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

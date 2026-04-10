@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.micrott.memory-web</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/microTT/toto/memory/bin/memory-web</string>
+    <string>--cwd</string>
+    <string>/Users/microTT/toto</string>
+    <string>--memory-home</string>
+    <string>/Users/microTT/.codex/memories/wsi_71adecfe4430</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>59112</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/microTT/toto</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/microTT/.codex/memories/wsi_71adecfe4430/control/memory-web.launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/microTT/.codex/memories/wsi_71adecfe4430/control/memory-web.launchd.err.log</string>
+</dict>
+</plist>

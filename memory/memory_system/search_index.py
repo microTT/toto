@@ -126,7 +126,14 @@ class SearchIndex:
             ORDER BY bm25_score
             LIMIT 20
         """
-        fts_rows = self.conn.execute(fts_sql, [*params, query]).fetchall()
+        fts_rows: list[sqlite3.Row] = []
+        fts_query = _build_fts_query(query)
+        if fts_query:
+            try:
+                fts_rows = self.conn.execute(fts_sql, [*params, fts_query]).fetchall()
+            except sqlite3.OperationalError:
+                # Fall back to vector-only ranking when the FTS parser rejects a query.
+                fts_rows = []
         fts_ranked = [(row["record_id"], row["bm25_score"], row) for row in fts_rows]
 
         fused: dict[str, dict[str, Any]] = {}
@@ -253,6 +260,11 @@ def _row_to_result(row: sqlite3.Row, fused_score: float, snippet: str | None = N
         "updated_at": row["updated_at"],
         "tags": json.loads(row["tags_json"]),
     }
+
+
+def _build_fts_query(query: str) -> str:
+    terms = [term.strip() for term in query.split() if term.strip()]
+    return " ".join(f'"{term.replace("\"", "\"\"")}"' for term in terms)
 
 
 def search_old_records(

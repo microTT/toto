@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ from .errors import PatchApplyError, SummarizerExecutionError
 from .markdown_store import load_document
 from .state_db import SummaryJob
 from .validation import validate_patch_plan
+from .workspace_store import iter_peer_memory_configs, iter_scoped_recent_documents
 
 DEFAULT_SUMMARIZER_MODEL = "qwen3-max"
 DEFAULT_SUMMARIZER_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -52,6 +54,66 @@ SUMMARIZER_SYSTEM_PROMPT = (
     "你的任务是根据当前对话增量和已有记忆，输出一个 JSON patch plan。"
     "不要输出 Markdown，不要输出解释，只能输出一个 JSON 对象。"
 )
+EXPLICIT_MEMORY_TERMS = ("记住", "remember")
+REPO_SPECIFIC_TERMS = (
+    "这个仓库",
+    "当前仓库",
+    "这个项目",
+    "当前项目",
+    "this repo",
+    "this repository",
+    "this project",
+    "current repo",
+    "current repository",
+    "current project",
+)
+LONG_TERM_MARKERS = (
+    "以后",
+    "今后",
+    "未来",
+    "长期",
+    "一直",
+    "后续对话",
+    "from now on",
+    "going forward",
+    "in future",
+    "future conversations",
+    "always",
+)
+PREFERENCE_CUES = (
+    "偏好",
+    "prefer",
+    "默认",
+    "default",
+    "总是",
+    "always",
+    "不要",
+    "不接受",
+    "avoid",
+    "don't",
+    "do not",
+    "只用",
+    "only use",
+)
+IDENTITY_CUES = ("叫我", "call me", "我叫", "my name is", "以后叫", "call the assistant")
+LANGUAGE_PREFERENCES = {
+    "中文": "Chinese",
+    "chinese": "Chinese",
+    "英文": "English",
+    "english": "English",
+}
+PACKAGE_MANAGERS = ("pnpm", "npm", "yarn", "bun")
+MAX_CROSS_WORKSPACE_EXAMPLES = 3
+
+
+@dataclass(slots=True)
+class ExplicitGlobalCandidate:
+    subject: str
+    summary: str
+    rationale: str
+    next_use: str | None
+    tags: list[str]
+    type: str = "preference"
 
 
 @dataclass(slots=True)
@@ -127,6 +189,111 @@ def load_summarizer_settings(*, env_file: str | os.PathLike[str] | None = None) 
     )
 
 
+def build_deterministic_patch_plan(
+    *,
+    config: MemoryConfig,
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    user_messages = [
+        str(event.get("user_message_delta", "")).strip()
+        for event in events
+        if str(event.get("user_message_delta", "")).strip()
+    ]
+    candidate = _extract_explicit_global_candidate(user_messages)
+    if candidate is None:
+        return None
+    global_document = load_document(config.global_memory_path, GLOBAL_SCOPE)
+    recent_documents = [
+        load_document(path, LOCAL_RECENT_SCOPE) for path in sorted(config.recent_dir.glob("*.md"))
+    ]
+    global_ops: list[dict[str, Any]] = []
+    local_ops: list[dict[str, Any]] = []
+    global_op = _build_global_upsert_op(global_document, candidate)
+    if global_op is not None:
+        global_ops.append(global_op)
+    next_step = _extract_next_step("\n".join(user_messages))
+    if next_step:
+        local_ops.append(_build_next_step_local_op(next_step))
+    if not global_ops and not local_ops:
+        decision = "noop"
+        reason = "显式长期记忆请求对应的全局记录已是最新状态"
+    else:
+        decision = "write"
+        reason = "检测到用户显式要求长期记住的偏好或身份事实"
+    return {
+        "decision": decision,
+        "reason": reason,
+        "base_revisions": {
+            "global_revision": global_document.revision,
+            "local_recent_revision": sum(document.revision for document in recent_documents),
+        },
+        "global_ops": global_ops,
+        "local_ops": local_ops,
+        "needs_manual_review": False,
+    }
+
+
+def build_cross_workspace_evidence(
+    *,
+    config: MemoryConfig,
+    user_messages: list[str],
+) -> dict[str, Any]:
+    candidate = _extract_explicit_global_candidate(user_messages)
+    peer_workspace_ids: set[str] = set()
+    if candidate is None:
+        for peer_config in iter_peer_memory_configs(config):
+            if peer_config.workspace_instance_id != config.workspace_instance_id:
+                peer_workspace_ids.add(peer_config.workspace_instance_id)
+        return {"peer_workspace_count": len(peer_workspace_ids), "candidate_matches": []}
+
+    global_hits = 0
+    local_hits = 0
+    examples: list[dict[str, str]] = []
+    for peer_config in iter_peer_memory_configs(config):
+        if peer_config.workspace_instance_id == config.workspace_instance_id:
+            continue
+        peer_workspace_ids.add(peer_config.workspace_instance_id)
+        peer_global = load_document(peer_config.global_memory_path, GLOBAL_SCOPE)
+        for record in peer_global.sections.get("Active", []):
+            if _record_matches_candidate(record, candidate):
+                global_hits += 1
+                if len(examples) < MAX_CROSS_WORKSPACE_EXAMPLES:
+                    examples.append(
+                        {
+                            "workspace_instance_id": peer_config.workspace_instance_id,
+                            "scope": "global",
+                            "subject": record.subject,
+                            "summary": record.summary,
+                        }
+                    )
+        for _, document in iter_scoped_recent_documents(peer_config):
+            for section in ("Open", "Active"):
+                for record in document.sections.get(section, []):
+                    if _record_matches_candidate(record, candidate):
+                        local_hits += 1
+                        if len(examples) < MAX_CROSS_WORKSPACE_EXAMPLES:
+                            examples.append(
+                                {
+                                    "workspace_instance_id": peer_config.workspace_instance_id,
+                                    "scope": "local",
+                                    "subject": record.subject,
+                                    "summary": record.summary,
+                                }
+                            )
+    return {
+        "peer_workspace_count": len(peer_workspace_ids),
+        "candidate_matches": [
+            {
+                "subject": candidate.subject,
+                "summary": candidate.summary,
+                "global_hit_count": global_hits,
+                "local_hit_count": local_hits,
+                "examples": examples,
+            }
+        ],
+    }
+
+
 def build_patch_prompt(
     *,
     config: MemoryConfig,
@@ -144,6 +311,12 @@ def build_patch_prompt(
     for document in recent_documents:
         for section in ("Open", "Active"):
             active_local.extend(record.to_dict() for record in document.sections.get(section, []))
+    user_messages = [
+        str(event.get("user_message_delta", "")).strip()
+        for event in events
+        if str(event.get("user_message_delta", "")).strip()
+    ]
+    cross_workspace_evidence = build_cross_workspace_evidence(config=config, user_messages=user_messages)
     delta_lines: list[str] = []
     for event in events:
         user_message = event.get("user_message_delta") or ""
@@ -166,6 +339,8 @@ def build_patch_prompt(
         f"{json.dumps(active_global, indent=2, ensure_ascii=True)}\n\n"
         "当前激活的本地近期记忆：\n"
         f"{json.dumps(active_local, indent=2, ensure_ascii=True)}\n\n"
+        "跨 workspace 相关证据：\n"
+        f"{json.dumps(cross_workspace_evidence, indent=2, ensure_ascii=True)}\n\n"
         "策略：\n"
         "- 全局记忆仅保留可跨仓库复用的长期偏好与稳定约束。\n"
         "- 本地近期记忆保留仓库相关的阻塞项、TODO、失败结论和近期事实。\n"
@@ -191,6 +366,9 @@ def summarize_job(
     events: list[dict[str, Any]],
     backend: str = "qwen",
 ) -> dict[str, Any]:
+    deterministic = build_deterministic_patch_plan(config=config, events=events)
+    if deterministic is not None:
+        return deterministic
     resolved_backend = LEGACY_BACKEND_ALIASES.get(backend, backend)
     if resolved_backend == "heuristic":
         return heuristic_patch_plan(config=config, events=events)
@@ -220,22 +398,7 @@ def heuristic_patch_plan(*, config: MemoryConfig, events: list[dict[str, Any]]) 
     if next_step:
         decision = "write"
         reason = "检测到显式的下一步记忆请求"
-        local_ops.append(
-            {
-                "action": "create",
-                "record": {
-                    "type": "task_context",
-                    "status": "open",
-                    "subject": "下一步",
-                    "summary": next_step,
-                    "confidence": "high",
-                    "tags": ["todo", "next-step"],
-                    "source_refs": [],
-                    "scope_reason": "仓库内近期待办",
-                    "next_use": f"恢复当前仓库工作时优先执行：{next_step}",
-                },
-            }
-        )
+        local_ops.append(_build_next_step_local_op(next_step))
     return {
         "decision": decision,
         "reason": reason,
@@ -454,6 +617,251 @@ def _normalize_decision(decision: Any, *, payload: dict[str, Any]) -> str:
     if payload.get("global_ops") or payload.get("local_ops"):
         return "write"
     return "noop"
+
+
+def _build_next_step_local_op(next_step: str) -> dict[str, Any]:
+    return {
+        "action": "create",
+        "record": {
+            "type": "task_context",
+            "status": "open",
+            "subject": "下一步",
+            "summary": next_step,
+            "confidence": "high",
+            "tags": ["todo", "next-step"],
+            "source_refs": [],
+            "scope_reason": "仓库内近期待办",
+            "next_use": f"恢复当前仓库工作时优先执行：{next_step}",
+        },
+    }
+
+
+def _build_global_upsert_op(
+    document,
+    candidate: ExplicitGlobalCandidate,
+) -> dict[str, Any] | None:
+    record_payload = {
+        "type": candidate.type,
+        "status": "active",
+        "confidence": "high",
+        "subject": candidate.subject,
+        "summary": candidate.summary,
+        "tags": list(candidate.tags),
+        "source_refs": [],
+        "scope_reason": "cross-workspace and durable",
+        "rationale": candidate.rationale,
+        "next_use": candidate.next_use,
+    }
+    existing = _find_active_global_record(document, candidate.subject)
+    if existing is None:
+        return {"action": "create", "record": record_payload}
+    if _record_matches_payload(existing, record_payload):
+        return None
+    return {"action": "update", "target_id": existing.id, "record_patch": record_payload}
+
+
+def _find_active_global_record(document, subject: str):
+    normalized_subject = _normalize_text(subject)
+    for record in document.sections.get("Active", []):
+        if _normalize_text(record.subject) == normalized_subject:
+            return record
+    return None
+
+
+def _record_matches_payload(record, payload: dict[str, Any]) -> bool:
+    current = record.to_dict()
+    for key, value in payload.items():
+        if current.get(key) != value:
+            return False
+    return True
+
+
+def _record_matches_candidate(record, candidate: ExplicitGlobalCandidate) -> bool:
+    if _normalize_text(record.subject) == _normalize_text(candidate.subject):
+        return True
+    haystack = _normalize_text(f"{record.subject} {record.summary}")
+    for token in _match_tokens(candidate.summary):
+        if token in haystack:
+            return True
+    return False
+
+
+def _extract_explicit_global_candidate(user_messages: list[str]) -> ExplicitGlobalCandidate | None:
+    for message in reversed(user_messages):
+        candidate = _extract_explicit_global_candidate_from_message(message)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _extract_explicit_global_candidate_from_message(message: str) -> ExplicitGlobalCandidate | None:
+    compact = " ".join(message.split())
+    if not compact:
+        return None
+    lowered = compact.lower()
+    if not any(term in lowered for term in EXPLICIT_MEMORY_TERMS):
+        return None
+    if _extract_next_step(compact, lowered=lowered):
+        return None
+    if any(term in lowered for term in REPO_SPECIFIC_TERMS):
+        return None
+    cleaned = _strip_memory_prefix(compact)
+    if not cleaned:
+        return None
+    candidate = _extract_assistant_name_candidate(cleaned)
+    if candidate is not None:
+        return candidate
+    candidate = _extract_user_name_candidate(cleaned)
+    if candidate is not None:
+        return candidate
+    candidate = _extract_package_manager_candidate(cleaned)
+    if candidate is not None:
+        return candidate
+    candidate = _extract_response_language_candidate(cleaned)
+    if candidate is not None:
+        return candidate
+    if _looks_like_durable_preference_or_identity(cleaned):
+        return ExplicitGlobalCandidate(
+            subject="Long-term user preference",
+            summary=cleaned,
+            rationale=f"Explicit user instruction: {compact}",
+            next_use="Apply this preference in future conversations unless the repository explicitly requires otherwise.",
+            tags=["explicit-memory", "preference"],
+        )
+    return None
+
+
+def _strip_memory_prefix(text: str) -> str:
+    patterns = (
+        r"^\s*(?:请|麻烦|帮我)?\s*(?:长期)?记住(?:一下)?[，,:：\s]*",
+        r"^\s*remember(?:\s+that)?[，,:：\s]*",
+    )
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, count=1, flags=re.IGNORECASE)
+    return cleaned.strip(" ，。,.!！?？:：;；")
+
+
+def _extract_assistant_name_candidate(text: str) -> ExplicitGlobalCandidate | None:
+    patterns = (
+        re.compile(r"(?:你|助手)(?:以后|今后|之后|未来|从现在起)?(?:都)?叫\s*([^\s，。,.!?！？；;]+)"),
+        re.compile(r"(?:call(?:\s+the)?\s+assistant|call\s+you)\s+([A-Za-z][A-Za-z0-9_-]{0,31})", re.IGNORECASE),
+    )
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        name = match.group(1).strip("“”\"'")
+        if not name:
+            continue
+        if _contains_cjk(text):
+            summary = f"用户希望在后续对话中把助手称为 {name}。"
+            next_use = f"后续对话中将助手称为 {name}。"
+        else:
+            summary = f"User wants the assistant to be called {name} in future conversations."
+            next_use = f"Refer to the assistant as {name} in future conversations."
+        return ExplicitGlobalCandidate(
+            subject="Assistant name preference",
+            summary=summary,
+            rationale=f"Explicit user instruction: {text}",
+            next_use=next_use,
+            tags=["assistant", "naming", "identity"],
+        )
+    return None
+
+
+def _extract_user_name_candidate(text: str) -> ExplicitGlobalCandidate | None:
+    patterns = (
+        re.compile(r"(?:叫我|请叫我)\s*([^\s，。,.!?！？；;]+)"),
+        re.compile(r"(?:call me|my name is)\s+([A-Za-z][A-Za-z0-9_-]{0,31})", re.IGNORECASE),
+        re.compile(r"我叫\s*([^\s，。,.!?！？；;]+)"),
+    )
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        name = match.group(1).strip("“”\"'")
+        if not name:
+            continue
+        if _contains_cjk(text):
+            summary = f"用户希望在后续对话中被称为 {name}。"
+            next_use = f"后续对话中使用 {name} 称呼用户。"
+        else:
+            summary = f"User prefers to be addressed as {name} in future conversations."
+            next_use = f"Address the user as {name} in future conversations."
+        return ExplicitGlobalCandidate(
+            subject="User name preference",
+            summary=summary,
+            rationale=f"Explicit user instruction: {text}",
+            next_use=next_use,
+            tags=["user", "naming", "identity"],
+        )
+    return None
+
+
+def _extract_package_manager_candidate(text: str) -> ExplicitGlobalCandidate | None:
+    lowered = text.lower()
+    if not any(manager in lowered for manager in PACKAGE_MANAGERS):
+        return None
+    if not any(marker in lowered for marker in LONG_TERM_MARKERS + PREFERENCE_CUES):
+        return None
+    preferred = next(manager for manager in PACKAGE_MANAGERS if manager in lowered)
+    summary = (
+        f"Future JavaScript/TypeScript repositories should default to {preferred} unless the repository explicitly requires another package manager."
+    )
+    return ExplicitGlobalCandidate(
+        subject="package manager preference",
+        summary=summary,
+        rationale=f"Explicit user instruction: {text}",
+        next_use=f"Default to {preferred} for future JavaScript/TypeScript work unless the repository explicitly requires another package manager.",
+        tags=["tooling", "package-manager", preferred],
+    )
+
+
+def _extract_response_language_candidate(text: str) -> ExplicitGlobalCandidate | None:
+    lowered = text.lower()
+    if not any(term in lowered for term in ("回复", "回答", "respond", "reply")):
+        return None
+    preferred_language = None
+    for term, label in LANGUAGE_PREFERENCES.items():
+        if term in lowered:
+            preferred_language = label
+            break
+    if preferred_language is None:
+        return None
+    summary = f"Prefer responses in {preferred_language}."
+    if preferred_language == "Chinese":
+        summary = "用户偏好使用中文回复。"
+    elif preferred_language == "English":
+        summary = "用户偏好使用英文回复。"
+    return ExplicitGlobalCandidate(
+        subject="Response language preference",
+        summary=summary,
+        rationale=f"Explicit user instruction: {text}",
+        next_use=f"Respond in {preferred_language} unless the user overrides it in the current turn.",
+        tags=["language", "response-style", preferred_language.lower()],
+    )
+
+
+def _looks_like_durable_preference_or_identity(text: str) -> bool:
+    lowered = text.lower()
+    has_durable_marker = any(marker in lowered for marker in LONG_TERM_MARKERS)
+    has_preference_cue = any(marker in lowered for marker in PREFERENCE_CUES + IDENTITY_CUES)
+    return has_durable_marker and has_preference_cue
+
+
+def _contains_cjk(text: str) -> bool:
+    return re.search(r"[\u4e00-\u9fff]", text) is not None
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _match_tokens(text: str) -> list[str]:
+    lowered = _normalize_text(text)
+    tokens = set(re.findall(r"[a-z0-9_+-]{3,}|[\u4e00-\u9fff]{2,}", lowered))
+    return sorted(tokens)
 
 
 def _extract_next_step(combined: str, *, lowered: str | None = None) -> str | None:

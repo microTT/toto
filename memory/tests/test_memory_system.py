@@ -6,10 +6,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 import sqlite3
 import subprocess
 from pathlib import Path
+from urllib import request as urllib_request
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +33,11 @@ from memory_system.record_store import find_record
 from memory_system.search_index import SearchIndex, search_old_records
 from memory_system.snapshot import build_snapshot
 from memory_system.state_db import StateDB, SummaryJob
-from memory_system.summarizer import load_summarizer_settings, summarize_job
+from memory_system.summarizer import build_patch_prompt, load_summarizer_settings, summarize_job
+from memory_system.web_service import (
+    build_workspace_detail_payload,
+    create_server,
+)
 from memory_system.worker import run_worker_once
 
 
@@ -214,6 +220,46 @@ class MemorySystemTest(unittest.TestCase):
             index.close()
         self.assertEqual(results[0]["record_id"], "l_old_closed")
 
+    def test_search_old_handles_punctuation_heavy_queries(self) -> None:
+        patch_plan = {
+            "decision": "write",
+            "reason": "seed archive search punctuation case",
+            "base_revisions": current_base_revisions(self.config),
+            "global_ops": [],
+            "local_ops": [
+                {
+                    "action": "create",
+                    "record": {
+                        "id": "l_old_ssh_details",
+                        "type": "task_context",
+                        "status": "closed",
+                        "confidence": "high",
+                        "subject": "ssh connection details",
+                        "summary": "Use aws-mm.pem to SSH into 13.217.101.74 as ubuntu or ec2-user.",
+                        "tags": ["aws", "ssh", "ec2-user"],
+                        "source_refs": [],
+                        "scope_reason": "repo-specific and near-term",
+                    },
+                }
+            ],
+            "needs_manual_review": False,
+        }
+        apply_patch_plan(self.config, patch_plan, now=_dt("2020-01-01T10:00:00Z"))
+        archive_stale_recent_documents(self.config, now=_dt("2020-01-03T10:00:00Z"))
+
+        index = SearchIndex(self.config.index_db_path)
+        try:
+            index.rebuild(self.config)
+            results = index.search_old(
+                workspace_instance_id=self.config.workspace_instance_id,
+                query="ladder AWS EC2 SSH host username pem 13.217.101.74 aws-mm.pem ubuntu ec2-user",
+                top_k=5,
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(results[0]["record_id"], "l_old_ssh_details")
+
     def test_same_repo_search_federates_across_peer_memory_homes(self) -> None:
         peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
         peer_workspace.mkdir(parents=True, exist_ok=True)
@@ -272,6 +318,142 @@ class MemorySystemTest(unittest.TestCase):
         self.assertEqual(current_scope_results, [])
         self.assertEqual(same_repo_results[0]["record_id"], "l_peer_closed")
         self.assertEqual(same_repo_results[0]["workspace_instance_id"], peer_identity.workspace_instance_id)
+
+    def test_web_service_workspace_detail_includes_global_recent_archive_and_snapshot(self) -> None:
+        self._run_admin(
+            [
+                "--cwd",
+                str(self.workspace),
+                "upsert",
+                "--scope",
+                "global",
+                "--id",
+                "g_launch_pref",
+                "--type",
+                "preference",
+                "--subject",
+                "launch agent preference",
+                "--summary",
+                "Prefer running the memory viewer as a local service.",
+                "--scope-reason",
+                "cross-workspace and durable",
+            ]
+        )
+        self._run_admin(
+            [
+                "--cwd",
+                str(self.workspace),
+                "upsert",
+                "--scope",
+                "local",
+                "--id",
+                "l_recent_follow_up",
+                "--type",
+                "task_context",
+                "--subject",
+                "web viewer follow-up",
+                "--summary",
+                "Polish the memory viewer UI after the API lands.",
+                "--scope-reason",
+                "repo-specific and near-term",
+            ]
+        )
+        archived_plan = {
+            "decision": "write",
+            "reason": "seed archived record for viewer",
+            "base_revisions": current_base_revisions(self.config),
+            "global_ops": [],
+            "local_ops": [
+                {
+                    "action": "create",
+                    "record": {
+                        "id": "l_archived_memory",
+                        "type": "failed_attempt",
+                        "status": "closed",
+                        "confidence": "high",
+                        "subject": "old archive note",
+                        "summary": "Archive this older failed attempt for the viewer.",
+                        "tags": ["archive"],
+                        "source_refs": [],
+                        "scope_reason": "repo-specific and near-term",
+                    },
+                }
+            ],
+            "needs_manual_review": False,
+        }
+        apply_patch_plan(self.config, archived_plan, now=_dt("2020-01-01T10:00:00Z"))
+        archive_stale_recent_documents(self.config, now=_dt("2020-01-03T10:00:00Z"))
+
+        snapshot_path = self.config.runtime_dir / "session_test-runtime.json"
+        snapshot_payload = build_snapshot(self.config).to_dict()
+        snapshot_payload["built_at"] = "2026-04-09T01:02:03Z"
+        snapshot_path.write_text(json.dumps(snapshot_payload, ensure_ascii=False), encoding="utf-8")
+
+        detail = build_workspace_detail_payload(self.config, current_config=self.config)
+        record_ids = {record["id"] for record in detail["records"]}
+
+        self.assertIn("g_launch_pref", record_ids)
+        self.assertIn("l_recent_follow_up", record_ids)
+        self.assertIn("l_archived_memory", record_ids)
+        self.assertEqual(detail["snapshot"]["source"], "runtime")
+        self.assertEqual(detail["snapshot"]["session_id"], "test-runtime")
+        self.assertEqual(detail["workspace"]["counts"]["global"], 1)
+        self.assertGreaterEqual(detail["workspace"]["counts"]["recent"], 1)
+        self.assertGreaterEqual(detail["workspace"]["counts"]["archive"], 1)
+
+    def test_web_service_http_api_serves_health_and_workspace_index(self) -> None:
+        peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
+        peer_workspace.mkdir(parents=True, exist_ok=True)
+        peer_identity = compute_workspace_identity(peer_workspace)
+        peer_config = MemoryConfig(
+            memory_home=Path(self.temp_dir.name) / peer_identity.workspace_instance_id,
+            workspace_root=peer_identity.workspace_root,
+            cwd=peer_identity.workspace_root,
+            repo_id=peer_identity.repo_id,
+            workspace_instance_id=peer_identity.workspace_instance_id,
+        )
+        ensure_layout(peer_config)
+        peer_document = empty_document(
+            LOCAL_RECENT_SCOPE,
+            path=peer_config.recent_dir / "2026-04-09.md",
+            metadata={
+                "repo_id": peer_config.repo_id,
+                "workspace_instance_id": peer_config.workspace_instance_id,
+                "workspace_root": str(peer_config.workspace_root),
+                "date": "2026-04-09",
+            },
+        )
+        peer_document.sections["Open"].append(
+            MemoryRecord(
+                id="l_peer_viewer",
+                type="fact",
+                status="open",
+                confidence="high",
+                subject="peer workspace memory",
+                summary="Peer workspace should appear in the viewer index.",
+                scope_reason="repo-specific and near-term",
+            )
+        )
+        save_document(peer_config.recent_dir / "2026-04-09.md", peer_document)
+
+        server = create_server(self.config, host="127.0.0.1", port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(thread.join, 1)
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+        with urllib_request.urlopen(f"{base_url}/api/health") as response:
+            health = json.loads(response.read().decode("utf-8"))
+        with urllib_request.urlopen(f"{base_url}/api/workspaces") as response:
+            workspace_index = json.loads(response.read().decode("utf-8"))
+
+        workspace_ids = {item["workspace_instance_id"] for item in workspace_index["workspaces"]}
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["workspace_instance_id"], self.config.workspace_instance_id)
+        self.assertIn(self.config.workspace_instance_id, workspace_ids)
+        self.assertIn(peer_identity.workspace_instance_id, workspace_ids)
 
     def test_snapshot_ignores_foreign_recent_documents_in_shared_memory_home(self) -> None:
         foreign_workspace = Path(self.temp_dir.name) / "workspace-foreign"
@@ -389,6 +571,129 @@ class MemorySystemTest(unittest.TestCase):
         self.assertTrue(worker_result["applied"])
         snapshot = build_snapshot(self.config)
         self.assertIn("revisit the failing auth snapshot", snapshot.rendered_text)
+
+    def test_hook_to_worker_flow_writes_explicit_long_term_preference_to_global(self) -> None:
+        run_hook(
+            "session-start",
+            {
+                "session_id": "session-global",
+                "turn_id": "turn-0",
+                "cwd": str(self.workspace),
+            },
+        )
+        stop_result = run_hook(
+            "stop",
+            {
+                "session_id": "session-global",
+                "turn_id": "turn-1",
+                "cwd": str(self.workspace),
+                "user_message_delta": "记住，你以后叫 思绎。",
+                "assistant_message_delta": "好，我会记住。",
+            },
+        )
+        self.assertEqual(stop_result, "")
+        worker_result = run_worker_once(str(self.workspace), backend="heuristic")
+        self.assertTrue(worker_result["applied"])
+
+        global_document = load_document(self.config.global_memory_path, GLOBAL_SCOPE)
+        record = next(record for record in all_records(global_document) if record.subject == "Assistant name preference")
+        self.assertEqual(record.status, STATUS_ACTIVE)
+        self.assertIn("思绎", record.summary)
+
+    def test_build_patch_prompt_includes_cross_workspace_evidence_for_explicit_global_candidate(self) -> None:
+        peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
+        peer_workspace.mkdir(parents=True, exist_ok=True)
+        peer_identity = compute_workspace_identity(peer_workspace)
+        peer_config = MemoryConfig(
+            memory_home=Path(self.temp_dir.name) / peer_identity.workspace_instance_id,
+            workspace_root=peer_identity.workspace_root,
+            cwd=peer_identity.workspace_root,
+            repo_id=peer_identity.repo_id,
+            workspace_instance_id=peer_identity.workspace_instance_id,
+        )
+        ensure_layout(peer_config)
+        apply_patch_plan(
+            peer_config,
+            {
+                "decision": "write",
+                "reason": "seed peer global preference",
+                "base_revisions": current_base_revisions(peer_config),
+                "global_ops": [
+                    {
+                        "action": "create",
+                        "record": {
+                            "id": "g_peer_pkg_pref",
+                            "type": "preference",
+                            "status": "active",
+                            "confidence": "high",
+                            "subject": "package manager preference",
+                            "summary": "Future JavaScript/TypeScript repositories should default to pnpm unless the repository explicitly requires another package manager.",
+                            "tags": ["tooling", "package-manager", "pnpm"],
+                            "source_refs": [],
+                            "scope_reason": "cross-workspace and durable",
+                        },
+                    }
+                ],
+                "local_ops": [],
+                "needs_manual_review": False,
+            },
+        )
+        apply_patch_plan(
+            peer_config,
+            {
+                "decision": "write",
+                "reason": "seed peer workspace identity",
+                "base_revisions": current_base_revisions(peer_config),
+                "global_ops": [],
+                "local_ops": [
+                    {
+                        "action": "create",
+                        "record": {
+                            "id": "l_peer_workspace_probe",
+                            "type": "task_context",
+                            "status": "open",
+                            "confidence": "high",
+                            "subject": "peer workspace probe",
+                            "summary": "Allow peer workspace discovery for prompt evidence tests.",
+                            "tags": [],
+                            "source_refs": [],
+                            "scope_reason": "repo-specific and near-term",
+                        },
+                    }
+                ],
+                "needs_manual_review": False,
+            },
+        )
+
+        job = SummaryJob(
+            id=99,
+            job_key="job-prompt-evidence",
+            session_id="session-prompt-evidence",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+        prompt = build_patch_prompt(
+            config=self.config,
+            job=job,
+            events=[{"user_message_delta": "记住，我以后默认用 pnpm。", "assistant_message_delta": "收到。"}],
+        )
+        self.assertIn('"subject": "package manager preference"', prompt)
+        self.assertIn('"global_hit_count": 1', prompt)
+        self.assertIn(peer_identity.workspace_instance_id, prompt)
 
     def test_worker_once_scans_peer_memory_homes(self) -> None:
         peer_workspace = Path(self.temp_dir.name) / "workspace-peer"
@@ -1115,6 +1420,42 @@ class MemorySystemTest(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertEqual(messages[1]["role"], "user")
         self.assertIn("记住下一步", messages[1]["content"])
+
+    def test_qwen_summarizer_short_circuits_explicit_global_memory_request(self) -> None:
+        job = SummaryJob(
+            id=8,
+            job_key="job-key-8",
+            session_id="session-qwen-8",
+            repo_id=self.config.repo_id,
+            workspace_instance_id=self.config.workspace_instance_id,
+            workspace_root=str(self.config.workspace_root),
+            transcript_path=None,
+            start_event_id=None,
+            end_event_id=1,
+            prompt_version="v1",
+            reason="test",
+            status="pending",
+            attempt_count=0,
+            max_attempts=3,
+            next_attempt_at="1970-01-01T00:00:00Z",
+            last_error=None,
+            payload={},
+            created_at="2026-04-02T00:00:00Z",
+            updated_at="2026-04-02T00:00:00Z",
+        )
+
+        with mock.patch("requests.post") as mocked_post:
+            patch_plan = summarize_job(
+                config=self.config,
+                job=job,
+                events=[{"user_message_delta": "记住，你以后叫 思绎。", "assistant_message_delta": "好。"}],
+                backend="qwen",
+            )
+
+        self.assertEqual(patch_plan["decision"], "write")
+        self.assertEqual(patch_plan["global_ops"][0]["record"]["subject"], "Assistant name preference")
+        self.assertIn("思绎", patch_plan["global_ops"][0]["record"]["summary"])
+        mocked_post.assert_not_called()
 
     def test_qwen_summarizer_normalizes_common_alias_fields(self) -> None:
         env_file = self._write_env(

@@ -20,6 +20,8 @@ Within `memory_home`, the layout is:
   Manual operations for bootstrap, context, upsert, delete, pin, archive, search, and index rebuild.
 - `memory/bin/memory-mcp`
   Minimal stdio MCP server. Installed usage should enable `--allow-writes` so `memory.upsert`, `memory.delete`, and `memory.rebuild_index` are exposed alongside read tools.
+- `memory/bin/memory-web`
+  Read-only local Web viewer for browsing global/recent/archive memories and the latest injected snapshot across peer workspaces.
 - `memory/memory_system/`
   Python implementation.
 - `memory/schemas/memory_patch.schema.json`
@@ -147,6 +149,61 @@ If you do not already know the workspace-specific home, derive it first:
 
 ```bash
 memory/bin/memory-admin --cwd /path/to/workspace bootstrap
+```
+
+## Web Viewer
+
+Run the local read-only web service:
+
+```bash
+memory/bin/memory-web --cwd /path/to/workspace
+```
+
+Default address:
+
+```text
+http://127.0.0.1:59112
+```
+
+Optional flags:
+
+- `--host`: override bind host, default `127.0.0.1`
+- `--port`: override bind port, default `59112`
+- `--memory-home`: force a specific memory home instead of resolving from `cwd`
+
+What the UI shows:
+
+- current workspace summary and latest injected snapshot
+- flattened global / recent / archive records for the selected workspace
+- peer workspaces discovered under the same `~/.codex/memories` parent directory
+- record detail fields including tags, rationale, next-use, and source refs
+
+JSON endpoints:
+
+- `GET /api/health`
+- `GET /api/workspaces`
+- `GET /api/workspaces/<workspace_instance_id>`
+- `GET /api/workspaces/<workspace_instance_id>/records/<record_id>`
+
+Run as a user LaunchAgent on macOS:
+
+```bash
+memory/scripts/install_web_launchd.sh --workspace /path/to/workspace
+```
+
+Optional launchd flags:
+
+- `--label`: override LaunchAgent label, default `com.micrott.memory-web`
+- `--host`: override bind host, default `127.0.0.1`
+- `--port`: override bind port, default `59112`
+- `--memory-home`: pin the derived memory home
+- `--python-bin`: override the Python interpreter used by launchd
+- `--dry-run`: print the generated plist without installing
+
+Uninstall:
+
+```bash
+memory/scripts/uninstall_web_launchd.sh
 ```
 
 ## Tests

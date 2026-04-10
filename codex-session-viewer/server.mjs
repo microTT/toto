@@ -15,6 +15,7 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const sessionsRoot = process.env.SESSIONS_ROOT || getDefaultSessionsRoot();
 const port = Number(process.env.PORT || 59111);
+const host = process.env.HOST || "127.0.0.1";
 
 function sendJson(response, statusCode, data) {
   response.writeHead(statusCode, {
@@ -85,11 +86,27 @@ function buildSessionPayload(parsedSession) {
       runtimeDeveloperMessages: turn.runtimeDeveloperMessages,
       memoryMessages: turn.memoryMessages,
       assistantMessages: turn.assistantMessages,
+      commentaryMessages: turn.commentaryMessages,
+      userMessageEvents: turn.userMessageEvents,
       toolCalls: turn.toolCalls,
       toolOutputs: turn.toolOutputs,
+      guardianAssessments: turn.guardianAssessments,
+      mcpToolCallResults: turn.mcpToolCallResults,
+      patchApplyEvents: turn.patchApplyEvents,
+      commandResults: turn.commandResults,
+      webSearchEvents: turn.webSearchEvents,
+      errors: turn.errors,
+      taskStarted: turn.taskStarted,
+      taskCompleted: turn.taskCompleted,
+      contextCompactedCount: turn.contextCompactedCount,
       reasoningCount: turn.reasoningCount,
       tokenSnapshots: turn.tokenSnapshots,
       lastTokenSnapshot: turn.lastTokenSnapshot,
+      skillTrace: turn.skillTrace,
+      promptEnvelope: turn.promptEnvelope,
+      approvalTrace: turn.approvalTrace,
+      compactionTrace: turn.compactionTrace,
+      turnMechanics: turn.turnMechanics,
       turnContext: turn.turnContext,
       turnContextCompact: turn.turnContextCompact,
       approxPrompt: turn.approxPrompt,
@@ -160,8 +177,8 @@ const server = http.createServer(async (request, response) => {
   await serveStatic(response, pathname);
 });
 
-server.listen(port, () => {
+server.listen(port, host, () => {
   console.log(
-    `Codex session viewer running at http://127.0.0.1:${port} (sessions root: ${sessionsRoot})`,
+    `Codex session viewer running at http://${host}:${port} (sessions root: ${sessionsRoot})`,
   );
 });

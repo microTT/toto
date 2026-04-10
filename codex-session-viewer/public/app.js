@@ -1,6 +1,7 @@
 const SESSION_FILTERS = [
   { id: "all", label: "All" },
   { id: "human-led", label: "Human-led" },
+  { id: "guardian", label: "Guardian" },
   { id: "long-context", label: "Long Context" },
   { id: "tool-heavy", label: "Tool-heavy" },
   { id: "system-like", label: "System-like" },
@@ -162,6 +163,26 @@ function compactPath(value) {
   return `${parts.slice(0, 2).join("/")}/…/${parts.slice(-2).join("/")}`;
 }
 
+function getSessionSourceKind(session) {
+  return session.sessionMeta?.sourceKind || session.sourceKind || "unknown";
+}
+
+function getSessionSourceLabel(session) {
+  return session.sessionMeta?.sourceLabel || session.sourceLabel || "Unknown";
+}
+
+function getSessionGit(session) {
+  return session.sessionMeta?.git || session.git || {};
+}
+
+function getSessionRepoLabel(session) {
+  return getSessionGit(session).repositoryLabel || "unknown repo";
+}
+
+function getSessionBranchLabel(session) {
+  return getSessionGit(session).branch || "unknown branch";
+}
+
 function serializeSignals(signals) {
   return signals.map((signal) => signal.label).join(" · ");
 }
@@ -226,6 +247,9 @@ function matchesFilter(session, filterId) {
   if (filterId === "human-led") {
     return !isSystemLikeSession(session);
   }
+  if (filterId === "guardian") {
+    return getSessionSourceKind(session) === "guardian";
+  }
   if (filterId === "long-context") {
     return isLongContextSession(session);
   }
@@ -240,6 +264,10 @@ function matchesFilter(session, filterId) {
 
 function getSessionSignals(session) {
   const signals = [];
+
+  if (getSessionSourceKind(session) === "guardian") {
+    signals.push({ tone: "warning", label: "Guardian" });
+  }
 
   if (isSystemLikeSession(session)) {
     signals.push({ tone: "warning", label: "System-like" });
@@ -286,6 +314,36 @@ function getTurnSignals(turn) {
     signals.push({ tone: "warning", label: `${turn.reasoningCount} reasoning` });
   }
 
+  if ((turn.skillTrace?.matchedSkillCount ?? 0) >= 1) {
+    signals.push({
+      tone: turn.skillTrace.matchedSkills.some((skill) => skill.actuallyRead)
+        ? "accent"
+        : "warning",
+      label: `${turn.skillTrace.matchedSkillCount} skill hit${turn.skillTrace.matchedSkillCount > 1 ? "s" : ""}`,
+    });
+  }
+
+  if ((turn.approvalTrace?.count ?? 0) >= 1) {
+    signals.push({
+      tone: turn.approvalTrace.deniedCount ? "danger" : "muted",
+      label: `${turn.approvalTrace.count} approval${turn.approvalTrace.count > 1 ? "s" : ""}`,
+    });
+  }
+
+  if ((turn.turnMechanics?.contextCompactedCount ?? 0) >= 1) {
+    signals.push({
+      tone: "warning",
+      label: `${turn.turnMechanics.contextCompactedCount} compacted`,
+    });
+  }
+
+  if ((turn.errors?.length ?? 0) >= 1) {
+    signals.push({
+      tone: "danger",
+      label: `${turn.errors.length} error${turn.errors.length > 1 ? "s" : ""}`,
+    });
+  }
+
   return signals;
 }
 
@@ -305,6 +363,592 @@ function renderSignalRow(signals) {
         .join("")}
     </div>
   `;
+}
+
+function getSkillReasonMeta(reasonType) {
+  if (reasonType === "explicit") {
+    return { label: "Explicit", tone: "human" };
+  }
+  if (reasonType === "semantic") {
+    return { label: "Semantic", tone: "warning" };
+  }
+  if (reasonType === "priority") {
+    return { label: "Priority", tone: "info" };
+  }
+  return { label: "Observed", tone: "muted" };
+}
+
+function renderSkillTraceSection(turn) {
+  const trace = turn.skillTrace;
+
+  if (!trace) {
+    return renderDetailSection(
+      "Skill Trace",
+      `<p class="empty-note">当前 turn 没有 skill trace 数据。</p>`,
+      {
+        tone: "info",
+        kicker: "Skill routing",
+        meta: "No parsed data",
+      },
+    );
+  }
+
+  const summarySignals = [
+    {
+      tone: trace.catalogInjected ? "info" : "muted",
+      label: trace.catalogInjected ? "Catalog in turn" : "Catalog reused",
+    },
+    {
+      tone: trace.matchedSkillCount ? "accent" : "muted",
+      label: `${trace.matchedSkillCount} matched`,
+    },
+    {
+      tone: "muted",
+      label: `${trace.availableSkillCount} visible`,
+    },
+  ];
+
+  const notesHtml = `
+    <div class="skill-trace-notes">
+      ${trace.notes.map((note) => `<p>${escapeHtml(note)}</p>`).join("")}
+    </div>
+  `;
+
+  if (!trace.matchedSkills.length) {
+    return renderDetailSection(
+      "Skill Trace",
+      `
+        ${renderSignalRow(summarySignals)}
+        ${notesHtml}
+      `,
+      {
+        tone: "info",
+        kicker: "Skill routing",
+        meta:
+          `${trace.availableSkillCount} skills visible` +
+          (trace.catalogPreview?.length
+            ? ` · sample: ${trace.catalogPreview.join(", ")}`
+            : ""),
+      },
+    );
+  }
+
+  const cardsHtml = trace.matchedSkills
+    .map((skill) => {
+      const reasonMetaSignals = [...new Map(
+        skill.reasons.map((reason) => {
+          const meta = getSkillReasonMeta(reason.type);
+          return [reason.type, { tone: meta.tone, label: meta.label }];
+        }),
+      ).values()];
+      const reasonSignals = [
+        {
+          tone: skill.status === "verified" ? "accent" : "warning",
+          label: skill.status === "verified" ? "Verified" : "Inferred",
+        },
+        {
+          tone: skill.actuallyRead ? "accent" : "muted",
+          label: skill.actuallyRead ? "Read SKILL.md" : "No direct file read",
+        },
+        ...reasonMetaSignals,
+      ];
+
+      const reasonItems = skill.reasons.length
+        ? skill.reasons
+            .map((reason) => {
+              const meta = getSkillReasonMeta(reason.type);
+              return `
+                <article class="skill-evidence-item">
+                  <div class="skill-evidence-topline">
+                    <strong>${escapeHtml(meta.label)}</strong>
+                    <span>${escapeHtml(reason.source)}</span>
+                    <span>${escapeHtml(formatDateTime(reason.timestamp))}</span>
+                  </div>
+                  <p>${escapeHtml(reason.evidence)}</p>
+                </article>
+              `;
+            })
+            .join("")
+        : `<p class="empty-note">没有记录到命中原因。</p>`;
+
+      const readItems = skill.readEvidence.length
+        ? skill.readEvidence
+            .map(
+              (entry) => `
+                <article class="skill-evidence-item">
+                  <div class="skill-evidence-topline">
+                    <strong>Read</strong>
+                    <span>${escapeHtml(entry.toolName || entry.source)}</span>
+                    <span>${escapeHtml(formatDateTime(entry.timestamp))}</span>
+                  </div>
+                  <p>${escapeHtml(entry.evidence)}</p>
+                </article>
+              `,
+            )
+            .join("")
+        : "";
+
+      return `
+        <article class="skill-card">
+          <div class="skill-card-header">
+            <div>
+              <h4>${escapeHtml(skill.name)}</h4>
+              <p class="skill-card-path" title="${escapeHtml(skill.path)}">${escapeHtml(
+                compactPath(skill.path),
+              )}</p>
+            </div>
+          </div>
+          ${skill.description ? `<p class="skill-card-description">${escapeHtml(skill.description)}</p>` : ""}
+          ${renderSignalRow(reasonSignals)}
+          <div class="skill-evidence-stack">
+            ${reasonItems}
+            ${readItems}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+
+  return renderDetailSection(
+    "Skill Trace",
+    `
+      ${renderSignalRow(summarySignals)}
+      <div class="skill-card-list">
+        ${cardsHtml}
+      </div>
+      ${notesHtml}
+    `,
+    {
+      tone: "info",
+      kicker: "Skill routing",
+      meta:
+        `${trace.matchedSkillCount} matched / ${trace.availableSkillCount} visible` +
+        (trace.catalogPreview?.length
+          ? ` · sample: ${trace.catalogPreview.join(", ")}`
+          : ""),
+    },
+  );
+}
+
+function formatPercent(value, digits = 1) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "—";
+  }
+  return `${Number(value).toFixed(digits)}%`;
+}
+
+function formatDuration(duration) {
+  if (!duration) {
+    return "—";
+  }
+
+  const millis = (duration.secs ?? 0) * 1000 + (duration.nanos ?? 0) / 1_000_000;
+  if (millis < 1000) {
+    return `${millis >= 100 ? Math.round(millis) : millis.toFixed(1)} ms`;
+  }
+
+  const seconds = millis / 1000;
+  return `${seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1)} s`;
+}
+
+function getApprovalStatusMeta(status) {
+  if (status === "approved") {
+    return { label: "Approved", tone: "accent" };
+  }
+  if (status === "denied") {
+    return { label: "Denied", tone: "danger" };
+  }
+  if (status === "in_progress") {
+    return { label: "In Progress", tone: "warning" };
+  }
+  return { label: status || "Unknown", tone: "muted" };
+}
+
+function getApprovalActionLabel(item) {
+  const action = item.action || {};
+
+  if (action.tool === "mcp_tool_call") {
+    return `${action.server}.${action.tool_name}`;
+  }
+
+  if (Array.isArray(action.command) && action.command.length) {
+    return shortText(action.command.join(" "), 108);
+  }
+
+  if (typeof action.command === "string" && action.command) {
+    return shortText(action.command, 108);
+  }
+
+  if (Array.isArray(action.files) && action.files.length) {
+    return `${action.tool || "guarded action"} · ${action.files.length} file${action.files.length > 1 ? "s" : ""}`;
+  }
+
+  if (item.toolCall?.name) {
+    return item.toolCall.name;
+  }
+
+  return action.tool || "guarded action";
+}
+
+function renderPromptEnvelopeSection(turn) {
+  const envelope = turn.promptEnvelope;
+
+  if (!envelope) {
+    return "";
+  }
+
+  const summarySignals = [
+    {
+      tone: envelope.placeholderCount ? "accent" : "muted",
+      label: `${envelope.placeholderCount} placeholder${envelope.placeholderCount > 1 ? "s" : ""}`,
+    },
+    {
+      tone: envelope.localImageCount || envelope.imageCount ? "info" : "muted",
+      label: `${envelope.imageCount + envelope.localImageCount} attachment${envelope.imageCount + envelope.localImageCount > 1 ? "s" : ""}`,
+    },
+  ];
+
+  const placeholderHtml = envelope.placeholders.length
+    ? `
+        <div class="timeline-list">
+          ${envelope.placeholders
+            .map(
+              (item) => `
+                <article class="timeline-card">
+                  <div class="timeline-meta">
+                    <strong>${escapeHtml(item.placeholder)}</strong>
+                    <span>${escapeHtml(
+                      item.start !== null && item.end !== null
+                        ? `bytes ${item.start}-${item.end}`
+                        : "range unknown",
+                    )}</span>
+                  </div>
+                </article>
+              `,
+            )
+            .join("")}
+        </div>
+      `
+    : `<p class="empty-note">这一轮没有结构化 prompt placeholder 或附件标记。</p>`;
+
+  return renderDetailSection(
+    "Prompt Envelope",
+    `
+      ${renderSignalRow(summarySignals)}
+      ${placeholderHtml}
+    `,
+    {
+      tone: "default",
+      kicker: "Input envelope",
+      meta:
+        `${envelope.messageCount} user_message event${envelope.messageCount > 1 ? "s" : ""}` +
+        ` · ${envelope.localImageCount} local image${envelope.localImageCount > 1 ? "s" : ""}`,
+    },
+  );
+}
+
+function renderProgressTraceSection(turn) {
+  const items = (turn.commentaryMessages || []).filter(
+    (item) => item.phase === "commentary" && item.message,
+  );
+
+  if (!items.length) {
+    return "";
+  }
+
+  return renderDetailSection(
+    "Progress Trace",
+    renderTimelineList(
+      items,
+      (item) => `
+        <article class="timeline-card">
+          <div class="timeline-meta">
+            <strong>Commentary</strong>
+            <span>${escapeHtml(formatDateTime(item.timestamp))}</span>
+          </div>
+          ${renderTextBlock(item.message, {
+            className: "timeline-block",
+            maxLines: 5,
+            maxChars: 720,
+            summaryLabel: "展开进度消息",
+          })}
+        </article>
+      `,
+      "这一轮没有中间进度消息。",
+    ),
+    {
+      tone: "info",
+      kicker: "User-visible process",
+      meta: `${items.length} commentary update${items.length > 1 ? "s" : ""}`,
+    },
+  );
+}
+
+function renderApprovalTraceSection(turn) {
+  const trace = turn.approvalTrace;
+
+  if (!trace?.count) {
+    return "";
+  }
+
+  const summarySignals = [
+    {
+      tone: trace.approvedCount ? "accent" : "muted",
+      label: `${trace.approvedCount} approved`,
+    },
+    {
+      tone: trace.deniedCount ? "danger" : "muted",
+      label: `${trace.deniedCount} denied`,
+    },
+    {
+      tone: trace.pendingCount ? "warning" : "muted",
+      label: `${trace.pendingCount} pending`,
+    },
+  ];
+
+  return renderDetailSection(
+    "Approval Trace",
+    `
+      ${renderSignalRow(summarySignals)}
+      ${renderTimelineList(
+        trace.items,
+        (item) => {
+          const statusMeta = getApprovalStatusMeta(item.finalStatus);
+          const extraSignals = [
+            { tone: statusMeta.tone, label: statusMeta.label },
+          ];
+
+          if (item.riskLevel) {
+            extraSignals.push({
+              tone:
+                item.riskLevel === "low"
+                  ? "muted"
+                  : item.riskLevel === "medium"
+                    ? "warning"
+                    : "danger",
+              label: `Risk ${item.riskLevel}`,
+            });
+          }
+
+          if (item.patchResult?.success) {
+            extraSignals.push({
+              tone: "accent",
+              label: `${Object.keys(item.patchResult.files || item.patchResult.changes || {}).length || item.patchResult.fileCount || 0} file patch`,
+            });
+          }
+
+          const resultText =
+            item.mcpResult?.resultText ||
+            item.commandResult?.output ||
+            item.toolOutput?.outputText ||
+            "";
+
+          return `
+            <article class="timeline-card">
+              <div class="timeline-meta">
+                <strong>${escapeHtml(getApprovalActionLabel(item))}</strong>
+                <span>${escapeHtml(formatDateTime(item.events.at(-1)?.timestamp))}</span>
+                <span>${escapeHtml(item.id)}</span>
+              </div>
+              ${renderSignalRow(extraSignals)}
+              ${item.rationale
+                ? renderTextBlock(item.rationale, {
+                    className: "timeline-block",
+                    maxLines: 4,
+                    maxChars: 560,
+                    summaryLabel: "展开审批理由",
+                  })
+                : ""}
+              ${resultText
+                ? renderTextBlock(resultText, {
+                    className: "timeline-block",
+                    maxLines: 4,
+                    maxChars: 560,
+                    summaryLabel: "展开调用结果",
+                  })
+                : ""}
+            </article>
+          `;
+        },
+        "这一轮没有 guardrail / approval 记录。",
+      )}
+    `,
+    {
+      tone: "warning",
+      kicker: "Guardrail decisions",
+      meta: `${trace.count} guarded action${trace.count > 1 ? "s" : ""}`,
+    },
+  );
+}
+
+function renderTurnMechanicsSection(turn) {
+  const mechanics = turn.turnMechanics;
+
+  if (!mechanics) {
+    return "";
+  }
+
+  const entries = [
+    ["Context Window", formatNumber(mechanics.modelContextWindow)],
+    ["Context Load", mechanics.contextUtilization !== null ? formatPercent(mechanics.contextUtilization * 100) : "—"],
+    ["Cached Input", formatNumber(mechanics.cachedInputTokens)],
+    ["Compactions", formatNumber(mechanics.contextCompactedCount)],
+    ["Mode", mechanics.collaborationModeKind || "unknown"],
+  ];
+
+  if (mechanics.rateLimits?.plan_type) {
+    entries.push(["Plan", mechanics.rateLimits.plan_type]);
+  }
+
+  if (mechanics.rateLimits?.primary?.used_percent !== undefined) {
+    entries.push([
+      "Primary Limit",
+      `${formatPercent(mechanics.rateLimits.primary.used_percent)} · reset ${formatDateTime(
+        (mechanics.rateLimits.primary.resets_at ?? 0) * 1000,
+      )}`,
+    ]);
+  }
+
+  if (mechanics.rateLimits?.secondary?.used_percent !== undefined) {
+    entries.push([
+      "Secondary Limit",
+      `${formatPercent(mechanics.rateLimits.secondary.used_percent)} · reset ${formatDateTime(
+        (mechanics.rateLimits.secondary.resets_at ?? 0) * 1000,
+      )}`,
+    ]);
+  }
+
+  const errorHtml = (turn.errors || []).length
+    ? `
+        <div class="timeline-list inline-section">
+          ${turn.errors
+            .map(
+              (item) => `
+                <article class="timeline-card">
+                  <div class="timeline-meta">
+                    <strong>${escapeHtml(item.code || "Codex error")}</strong>
+                    <span>${escapeHtml(formatDateTime(item.timestamp))}</span>
+                  </div>
+                  <p class="inline-note">${escapeHtml(item.message)}</p>
+                </article>
+              `,
+            )
+            .join("")}
+        </div>
+      `
+    : "";
+
+  return renderDetailSection(
+    "Turn Mechanics",
+    `
+      <div class="section-stack">
+        ${renderKeyValueList(entries)}
+        ${errorHtml}
+      </div>
+    `,
+    {
+      tone: "default",
+      kicker: "Runtime mechanics",
+      meta:
+        `${formatNumber(mechanics.inputTokens)} in · ${formatNumber(mechanics.outputTokens)} out · ` +
+        `${formatNumber(mechanics.reasoningTokens)} reasoning`,
+    },
+  );
+}
+
+function renderProvenanceSection(session, turn) {
+  const git = getSessionGit(session);
+  const entries = [
+    ["Source", getSessionSourceLabel(session)],
+    ["Originator", session.sessionMeta.originator || "unknown"],
+    ["Model Provider", session.sessionMeta.modelProvider || "unknown"],
+    ["CLI Version", session.sessionMeta.cliVersion || "unknown"],
+    ["Repo", git.repositoryLabel || "unknown"],
+    ["Branch", git.branch || "unknown"],
+    ["Commit", git.commitShort || "unknown"],
+    ["CWD", compactPath(session.sessionMeta.cwd || session.filePath)],
+  ];
+
+  if (turn.turnContextCompact?.collaborationMode) {
+    entries.push(["Turn Mode", turn.turnContextCompact.collaborationMode]);
+  }
+
+  return renderDetailSection(
+    "Session Provenance",
+    renderKeyValueList(entries),
+    {
+      tone: "default",
+      kicker: "Session origin",
+      meta: git.repositoryUrl || session.filePath,
+    },
+  );
+}
+
+function renderCompactionTraceSection(turn) {
+  const trace = turn.compactionTrace;
+
+  if (!trace?.count) {
+    return "";
+  }
+
+  const summarySignals = [
+    {
+      tone: "warning",
+      label: `${trace.count} compaction${trace.count > 1 ? "s" : ""}`,
+    },
+    {
+      tone: "muted",
+      label: `${trace.replacedEntryTotal} replaced item${trace.replacedEntryTotal > 1 ? "s" : ""}`,
+    },
+  ];
+
+  return renderDetailSection(
+    "Compaction Trace",
+    `
+      ${renderSignalRow(summarySignals)}
+      ${renderTimelineList(
+        trace.items,
+        (item) => {
+          const roleSignals = Object.entries(item.roleCounts || {})
+            .sort((left, right) => left[0].localeCompare(right[0]))
+            .map(([role, count]) => ({
+              tone: role === "user" || role === "assistant" ? "info" : "muted",
+              label: `${count} ${role}`,
+            }));
+
+          return `
+            <article class="timeline-card">
+              <div class="timeline-meta">
+                <strong>${escapeHtml(`${item.replacementCount} items compacted`)}</strong>
+                <span>${escapeHtml(formatDateTime(item.timestamp))}</span>
+              </div>
+              ${renderSignalRow(roleSignals)}
+              ${item.summaryMessage
+                ? renderTextBlock(item.summaryMessage, {
+                    className: "timeline-block",
+                    maxLines: 4,
+                    maxChars: 560,
+                    summaryLabel: "展开压缩摘要",
+                  })
+                : `<p class="inline-note">这一轮没有额外 compaction summary，只保留 replacement history。</p>`}
+              ${renderTextBlock(item.transcript || item.preview || "(empty)", {
+                className: "timeline-block",
+                maxLines: 8,
+                maxChars: 1000,
+                summaryLabel: "展开被压缩的历史消息",
+              })}
+            </article>
+          `;
+        },
+        "这一轮没有上下文压缩记录。",
+      )}
+    `,
+    {
+      tone: "warning",
+      kicker: "Prompt history compression",
+      meta: "这些记录代表 Codex 为腾出上下文窗口而压缩掉的旧消息。",
+    },
+  );
 }
 
 function getVisibleGroups() {
@@ -328,6 +972,9 @@ function getVisibleGroups() {
           session.firstPrompt,
           session.latestPrompt,
           session.model,
+          getSessionSourceLabel(session),
+          getSessionRepoLabel(session),
+          getSessionBranchLabel(session),
           serializeSignals(getSessionSignals(session)),
         ]
           .filter(Boolean)
@@ -551,6 +1198,9 @@ function renderSessions() {
                     </div>
                     <p class="session-title">${escapeHtml(shortText(session.latestPrompt, 96))}</p>
                     <p class="session-subtitle">${escapeHtml(compactPath(session.cwd || session.filePath))}</p>
+                    <p class="session-subtitle session-subtitle-secondary">${escapeHtml(
+                      `${getSessionSourceLabel(session)} · ${getSessionRepoLabel(session)} · ${getSessionBranchLabel(session)}`,
+                    )}</p>
                     ${signals}
                     <div class="session-metrics">
                       <span>${formatNumber(getSessionTurnCount(session))} turns</span>
@@ -597,6 +1247,12 @@ function getMessageRoleMeta(record) {
   if (record.kind === "tool-output") {
     return { label: "Tool Output", tone: "info" };
   }
+  if (record.kind === "commentary") {
+    return { label: "Progress", tone: "info" };
+  }
+  if (record.kind === "error") {
+    return { label: "Error", tone: "danger" };
+  }
   return { label: "Message", tone: "muted" };
 }
 
@@ -618,11 +1274,26 @@ function buildSessionMessages(session) {
         sequence: sequence + 1,
       };
 
-      if (record.type !== "response_item") {
+      const payload = record.payload ?? {};
+
+      if (record.type === "event_msg" && payload.type === "error") {
+        const text = (payload.message || "unknown error").trim();
+        messages.push({
+          ...base,
+          kind: "error",
+          role: "system",
+          title: "Error",
+          text,
+          preview: shortText(text, 108),
+          code: payload.codex_error_info || null,
+        });
+        sequence += 1;
         return;
       }
 
-      const payload = record.payload ?? {};
+      if (record.type !== "response_item") {
+        return;
+      }
 
       if (payload.type === "message") {
         const text = extractTextFromContent(payload.content).trim();
@@ -668,7 +1339,40 @@ function buildSessionMessages(session) {
         return;
       }
 
+      if (payload.type === "custom_tool_call") {
+        const text = serializeValue(payload.input ?? "");
+        messages.push({
+          ...base,
+          kind: "tool-call",
+          role: "tool",
+          title: payload.name ? `Tool Call · ${payload.name}` : "Tool Call",
+          name: payload.name ?? "custom_tool",
+          callId: payload.call_id ?? null,
+          text,
+          preview: payload.name
+            ? `${payload.name} · ${shortText(text || "(no input)", 76)}`
+            : shortText(text || "(no input)", 92),
+        });
+        sequence += 1;
+        return;
+      }
+
       if (payload.type === "function_call_output") {
+        const text = serializeValue(payload.output);
+        messages.push({
+          ...base,
+          kind: "tool-output",
+          role: "tool",
+          title: payload.call_id ? `Tool Output · ${payload.call_id}` : "Tool Output",
+          callId: payload.call_id ?? null,
+          text,
+          preview: shortText(text || "(empty output)", 92),
+        });
+        sequence += 1;
+        return;
+      }
+
+      if (payload.type === "custom_tool_call_output") {
         const text = serializeValue(payload.output);
         messages.push({
           ...base,
@@ -884,7 +1588,9 @@ function renderDetailSection(title, bodyHtml, options = {}) {
           ${meta ? `<p class="section-meta">${escapeHtml(meta)}</p>` : ""}
         </div>
       </div>
-      ${bodyHtml}
+      <div class="detail-section-body">
+        ${bodyHtml}
+      </div>
     </section>
   `;
 }
@@ -1004,9 +1710,13 @@ function renderMessageDetail() {
     ["Message Position", `${selectedPosition} / ${sessionMessages.length}`],
     ["Turn ID", turn.id],
     ["Selected Role", roleMeta.label],
+    ["Source", getSessionSourceLabel(session)],
     ["Model", turn.turnContextCompact?.model || "unknown"],
     ["Effort", turn.turnContextCompact?.effort || "unknown"],
     ["Approval", turn.turnContextCompact?.approvalPolicy || "unknown"],
+    ["Repo", getSessionRepoLabel(session)],
+    ["Branch", getSessionBranchLabel(session)],
+    ["Commit", getSessionGit(session).commitShort || "unknown"],
     ["Started", formatDateTime(turn.startedAt)],
     ["Finished", formatDateTime(turn.finishedAt)],
     ["Turns in Session", String(session.turns.length)],
@@ -1016,10 +1726,13 @@ function renderMessageDetail() {
 
   const tokenEntries = [
     ["Input Tokens", formatNumber(turn.lastTokenSnapshot?.inputTokens ?? 0)],
+    ["Cached Input", formatNumber(turn.lastTokenSnapshot?.cachedInputTokens ?? 0)],
     ["Output Tokens", formatNumber(turn.lastTokenSnapshot?.outputTokens ?? 0)],
     ["Reasoning Tokens", formatNumber(turn.lastTokenSnapshot?.reasoningTokens ?? 0)],
     ["Tool Calls", String(turn.toolCalls.length)],
     ["Tool Outputs", String(turn.toolOutputs.length)],
+    ["Approvals", String(turn.approvalTrace?.count ?? 0)],
+    ["Compactions", String(turn.turnMechanics?.contextCompactedCount ?? 0)],
     ["Memory Injects", String(turn.memoryMessages.length)],
     ["Runtime Injects", String(turn.runtimeDeveloperMessages.length)],
     ["Reasoning Items", String(turn.reasoningCount)],
@@ -1063,6 +1776,22 @@ function renderMessageDetail() {
           meta: `${formatNumber(turnMessages.length)} messages in turn ${turn.index}`,
         },
       )}
+    </section>
+
+    <section class="detail-grid">
+      ${renderProvenanceSection(session, turn)}
+      ${renderSkillTraceSection(turn)}
+    </section>
+
+    <section class="detail-grid">
+      ${renderPromptEnvelopeSection(turn)}
+      ${renderTurnMechanicsSection(turn)}
+    </section>
+
+    <section class="detail-grid">
+      ${renderCompactionTraceSection(turn)}
+      ${renderProgressTraceSection(turn)}
+      ${renderApprovalTraceSection(turn)}
     </section>
 
     <section class="detail-grid">

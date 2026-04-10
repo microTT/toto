@@ -1,0 +1,22 @@
+{
+  "ports": {
+    "59110": {
+      "name": "OpenClaw Control",
+      "group": "AI Tools",
+      "description": "OpenClaw 的本地控制台。",
+      "tags": [
+        "openclaw",
+        "control"
+      ]
+    },
+    "59111": {
+      "name": "Session 管理",
+      "group": "Codex",
+      "description": "Codex Session Viewer，本地会话与 prompt 取证工作台。",
+      "tags": [
+        "codex",
+        "session"
+      ]
+    }
+  }
+}

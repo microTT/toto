@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Service Atlas</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <main class="app-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Port Memory for Local Work</p>
+          <h1>Local Service Atlas</h1>
+          <p class="hero-text">
+            自动发现这台机器上正在监听的本地服务，尽量补齐 HTTP 页面标题，并允许你给端口写上长期别名。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshButton" class="ghost-button" type="button">立即刷新</button>
+          <div id="healthBadge" class="status-badge">扫描中</div>
+        </div>
+      </header>
+
+      <section class="summary-grid">
+        <article class="summary-card">
+          <span>Discovered</span>
+          <strong id="totalCount">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>Web UI</span>
+          <strong id="webCount">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>Named</span>
+          <strong id="namedCount">-</strong>
+        </article>
+        <article class="summary-card">
+          <span>Refreshed</span>
+          <strong id="updatedAt">-</strong>
+        </article>
+      </section>
+
+      <section class="control-bar">
+        <label class="search-box">
+          <span>Search</span>
+          <input
+            id="searchInput"
+            type="search"
+            placeholder="端口 / 名称 / 进程 / 标签"
+            autocomplete="off"
+          />
+        </label>
+        <div class="filter-box">
+          <span>Lens</span>
+          <div id="filterChips" class="filter-chips"></div>
+        </div>
+      </section>
+
+      <section class="meta-strip">
+        <div>
+          <span class="meta-label">Alias file</span>
+          <strong id="configPath">-</strong>
+        </div>
+        <div>
+          <span class="meta-label">Host user</span>
+          <strong id="hostUser">-</strong>
+        </div>
+        <div>
+          <span class="meta-label">Auto refresh</span>
+          <strong>20s</strong>
+        </div>
+      </section>
+
+      <section id="serviceGrid" class="service-grid" aria-live="polite"></section>
+    </main>
+
+    <dialog id="aliasDialog" class="alias-dialog">
+      <form method="dialog" class="dialog-panel" id="aliasForm">
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow">Alias Editor</p>
+            <h2 id="dialogTitle">编辑端口别名</h2>
+          </div>
+          <button class="ghost-button small" type="button" id="closeDialogButton">关闭</button>
+        </header>
+
+        <div class="dialog-grid">
+          <label>
+            <span>名称</span>
+            <input id="aliasName" name="name" type="text" placeholder="例如：Session 管理" />
+          </label>
+          <label>
+            <span>分组</span>
+            <input id="aliasGroup" name="group" type="text" placeholder="例如：Codex" />
+          </label>
+          <label class="wide">
+            <span>说明</span>
+            <textarea
+              id="aliasDescription"
+              name="description"
+              rows="4"
+              placeholder="写一点你未来会感谢现在自己的备注"
+            ></textarea>
+          </label>
+          <label class="wide">
+            <span>标签</span>
+            <input
+              id="aliasTags"
+              name="tags"
+              type="text"
+              placeholder="用逗号分隔，例如：codex, session"
+            />
+          </label>
+        </div>
+
+        <footer class="dialog-actions">
+          <button class="ghost-button" type="button" id="clearAliasButton">清空别名</button>
+          <button class="primary-button" type="submit">保存</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <template id="emptyStateTemplate">
+      <article class="empty-state">
+        <h2>没有匹配结果</h2>
+        <p>换个搜索词，或者切回 `All` 看看系统当前真正监听了哪些端口。</p>
+      </article>
+    </template>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
